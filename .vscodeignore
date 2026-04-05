@@ -1,0 +1,8 @@
+.git/**
+.gitignore
+.vscode-test/**
+scripts/**
+test/**
+*.vsix
+*.log
+.tmp-webview-test.html

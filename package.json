@@ -1,0 +1,530 @@
+{
+  "name": "localai-code",
+  "displayName": "LocalAI Code — LM Studio",
+  "description": "AI coding assistant powered by LM Studio with persistent chats, memory, hybrid retrieval, autonomous agent tasks, sandboxed tool use, and optional remote execution.",
+  "version": "1.2.0",
+  "publisher": "localai",
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "engines": {
+    "vscode": "^1.94.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "keywords": [
+    "lm studio",
+    "local ai",
+    "copilot",
+    "claude",
+    "codex",
+    "llm",
+    "rag",
+    "sandbox",
+    "agent"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "scripts": {
+    "cloud:executor": "node cloud-executor/server.js",
+    "test:cloud-smoke": "node scripts/run-cloud-executor-smoke.js",
+    "test:vscode-live": "node scripts/run-vscode-live-tests.js"
+  },
+  "contributes": {
+    "configuration": {
+      "title": "LocalAI Code",
+      "properties": {
+        "localai.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:1234/v1",
+          "description": "Base URL for LM Studio's OpenAI-compatible API.",
+          "order": 1
+        },
+        "localai.nativeBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:1234",
+          "description": "Base URL for LM Studio's native server and diagnostics endpoints.",
+          "order": 2
+        },
+        "localai.modelId": {
+          "type": "string",
+          "default": "auto",
+          "description": "Chat model ID to use through LM Studio. Use \"auto\" to select the first available chat-capable model.",
+          "order": 3
+        },
+        "localai.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature (0 = deterministic, 2 = very creative)",
+          "order": 4
+        },
+        "localai.maxTokens": {
+          "type": "number",
+          "default": 4096,
+          "description": "Maximum tokens in the response",
+          "order": 5
+        },
+        "localai.enableInlineCompletions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable ghost-text inline code completions as you type",
+          "order": 6
+        },
+        "localai.completionDebounceMs": {
+          "type": "number",
+          "default": 1000,
+          "description": "Debounce delay (ms) before triggering an inline completion (higher for API calls to avoid rate limits)",
+          "order": 7
+        },
+        "localai.systemPrompt": {
+          "type": "string",
+          "default": "You are LocalAI Code, an expert coding assistant powered by LM Studio. You help with code generation, explanation, debugging, and refactoring. Always provide complete, working code. Format code in markdown code blocks with proper language tags.",
+          "description": "System prompt sent to the model for every chat conversation",
+          "order": 8
+        },
+        "localai.instructions.global": {
+          "type": "string",
+          "default": "",
+          "description": "Additional global instructions applied to every chat across all workspaces. Use this for stable preferences, output rules, and coding conventions.",
+          "order": 50
+        },
+        "localai.instructions.workspace": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace-scoped instructions applied to chats in the current project. Use this for repo conventions, architecture rules, and team expectations.",
+          "order": 51
+        },
+        "localai.sendFileContext": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically include the current file's content as context in chat",
+          "order": 9
+        },
+        "localai.contextLines": {
+          "type": "number",
+          "default": 80,
+          "description": "Number of lines around cursor to include as inline completion context",
+          "order": 10
+        },
+        "localai.memory.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable persistent chat memory and rolling summaries",
+          "order": 10
+        },
+        "localai.memory.scope": {
+          "type": "string",
+          "default": "global+workspace",
+          "enum": [
+            "workspace",
+            "global+workspace",
+            "global"
+          ],
+          "enumDescriptions": [
+            "Memory is scoped to the current workspace only. Notes are stored per-project and shared across all chats in that workspace. Ideal for project-specific knowledge.",
+            "Default: memory works both globally (shared across all workspaces) and per-workspace (project-specific). Global notes cover personal preferences and cross-project habits; workspace notes cover project conventions.",
+            "Memory is stored globally and shared across all workspaces and chats. Useful for personal coding preferences, but does not track project-specific details."
+          ],
+          "description": "Choose whether memory is stored per workspace, globally, or both. Global+workspace (default) gives you the best of both: cross-project preferences plus project-specific notes.",
+          "order": 11
+        },
+        "localai.memory.maxRecentMessages": {
+          "type": "number",
+          "default": 12,
+          "description": "Number of recent raw messages kept in the live prompt before relying on the rolling summary",
+          "order": 12
+        },
+        "localai.memory.compactionThresholdMessages": {
+          "type": "number",
+          "default": 12,
+          "description": "Minimum number of older messages before the assistant compacts them into persistent summary memory",
+          "order": 13
+        },
+        "localai.rag.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable local workspace retrieval for chat context",
+          "order": 14
+        },
+        "localai.rag.mode": {
+          "type": "string",
+          "default": "hybrid-local",
+          "enum": [
+            "hybrid-local",
+            "lexical-only"
+          ],
+          "description": "Choose between hybrid lexical plus semantic retrieval or lexical retrieval only",
+          "order": 15
+        },
+        "localai.rag.embeddingModel": {
+          "type": "string",
+          "default": "auto",
+          "description": "Embedding model used for semantic workspace retrieval. Use \"auto\" to pick a likely embedding model from the loaded LM Studio models.",
+          "order": 16
+        },
+        "localai.rag.topK": {
+          "type": "number",
+          "default": 8,
+          "description": "Maximum number of retrieved workspace snippets injected into a chat request",
+          "order": 17
+        },
+        "localai.rag.chunkSizeChars": {
+          "type": "number",
+          "default": 1200,
+          "description": "Chunk size in characters used to split indexed files for retrieval",
+          "order": 18
+        },
+        "localai.rag.chunkOverlapChars": {
+          "type": "number",
+          "default": 200,
+          "description": "Chunk overlap in characters used during indexing to preserve local context across snippet boundaries",
+          "order": 19
+        },
+        "localai.rag.embeddingMaxRetries": {
+          "type": "number",
+          "default": 3,
+          "description": "Maximum number of retry attempts for embedding API calls with exponential backoff. Set to 0 to disable retries.",
+          "order": 20
+        },
+        "localai.rag.autoRefreshIntervalMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "maximum": 120,
+          "description": "Interval in minutes for automatic full index refresh to prevent staleness. Set to 0 to disable periodic refresh.",
+          "order": 21
+        },
+        "localai.agent.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable autonomous multi-step agent mode with local file, search, and shell tools",
+          "order": 22
+        },
+        "localai.agent.maxRounds": {
+          "type": "number",
+          "default": 6,
+          "description": "Maximum number of autonomous tool rounds before the agent stops",
+          "order": 23
+        },
+        "localai.agent.allowShell": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow the agent to run local shell commands in the workspace",
+          "order": 24
+        },
+        "localai.agent.shellTimeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "description": "Maximum runtime for a local shell command started by the agent",
+          "order": 25
+        },
+        "localai.agent.preferWebForFreshInfo": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, the agent automatically prefers web research for time-sensitive topics like security updates, versions, release notes, and recent documentation changes.",
+          "order": 26
+        },
+        "localai.agent.maxConcurrentTasks": {
+          "type": "number",
+          "default": 2,
+          "description": "Maximum number of background agent tasks running at the same time",
+          "order": 27
+        },
+        "localai.cloud.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run background agent tasks on a remote isolated cloud executor instead of the local workspace runtime",
+          "order": 28
+        },
+        "localai.cloud.executorUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Base URL of the remote cloud executor API (for example http://127.0.0.1:7788)",
+          "order": 29
+        },
+        "localai.cloud.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional bearer token used to authenticate the extension against the cloud executor",
+          "order": 30
+        },
+        "localai.cloud.pollIntervalMs": {
+          "type": "number",
+          "default": 5000,
+          "description": "Polling interval in milliseconds used to sync remote task state back into VS Code",
+          "order": 31
+        },
+        "localai.cloud.maxSnapshotFiles": {
+          "type": "number",
+          "default": 280,
+          "description": "Maximum number of files to include in the cloud workspace snapshot. Set to 0 to use the default limit.",
+          "order": 32
+        },
+        "localai.cloud.maxSnapshotTotalBytes": {
+          "type": "number",
+          "default": 3145728,
+          "description": "Maximum total size in bytes of all files in the cloud workspace snapshot (default: 3MB).",
+          "order": 33
+        },
+        "localai.cloud.maxSnapshotFileBytes": {
+          "type": "number",
+          "default": 220000,
+          "description": "Maximum size in bytes for a single file in the cloud workspace snapshot (default: 220KB).",
+          "order": 34
+        },
+        "localai.sandbox.containerModelBaseUrl": {
+          "type": "string",
+          "default": "http://host.docker.internal:1234/v1",
+          "description": "LM Studio OpenAI-compatible base URL that sandbox containers should use when they need host model access.",
+          "order": 35
+        },
+        "localai.sandbox.containerNativeBaseUrl": {
+          "type": "string",
+          "default": "http://host.docker.internal:1234",
+          "description": "LM Studio native API base URL that sandbox containers should use for diagnostics or native endpoints.",
+          "order": 36
+        },
+        "localai.sandbox.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run all autonomous file, search, git, and shell tools inside a Docker sandbox instead of touching the host workspace directly.",
+          "order": 37
+        },
+        "localai.sandbox.runtimeRequired": {
+          "type": "boolean",
+          "default": false,
+          "description": "Block agent execution when Docker or the sandbox image is unavailable instead of silently falling back to host execution.",
+          "order": 38
+        },
+        "localai.sandbox.image": {
+          "type": "string",
+          "default": "localai-code-sandbox:latest",
+          "description": "Docker image used for the local and remote workspace sandbox runtime.",
+          "order": 39
+        },
+        "localai.sandbox.autoBuildImage": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically build the sandbox image from sandbox/Dockerfile when it is missing.",
+          "order": 40
+        },
+        "localai.sandbox.networkMode": {
+          "type": "string",
+          "default": "none",
+          "enum": [
+            "none",
+            "bridge"
+          ],
+          "description": "Network mode for sandbox containers. The default is fully offline.",
+          "order": 41
+        },
+        "localai.sandbox.maxConcurrentSandboxes": {
+          "type": "number",
+          "default": 2,
+          "description": "Maximum number of sandboxed local agent tasks allowed to run at the same time.",
+          "order": 42
+        },
+        "localai.sandbox.toolTimeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "description": "Maximum runtime for a single sandbox tool call or shell command.",
+          "order": 43
+        },
+        "localai.sandbox.retainOnFailure": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep sandbox workspaces and containers after failed tasks for postmortem review.",
+          "order": 44
+        },
+        "localai.web.searchProvider": {
+          "type": "string",
+          "default": "duckduckgo",
+          "enum": [
+            "duckduckgo",
+            "bing",
+            "google"
+          ],
+          "description": "Search provider used by the web_search tool. DuckDuckGo uses a free HTML endpoint and requires no API key.",
+          "order": 45
+        },
+        "localai.web.searchApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional API credential for authenticated search providers. Use a Bing API key for Bing, or API_KEY|CX for Google Custom Search. Not needed for DuckDuckGo.",
+          "order": 46
+        },
+        "localai.web.fetchMaxChars": {
+          "type": "number",
+          "default": 4000,
+          "description": "Default maximum characters returned by the web_fetch tool.",
+          "order": 47
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "localai.openChat",
+        "title": "LocalAI: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "localai.newChat",
+        "title": "LocalAI: New Conversation",
+        "icon": "$(add)"
+      },
+      {
+        "command": "localai.explainCode",
+        "title": "LocalAI: Explain Code"
+      },
+      {
+        "command": "localai.fixCode",
+        "title": "LocalAI: Fix Code / Errors"
+      },
+      {
+        "command": "localai.refactorCode",
+        "title": "LocalAI: Refactor Code"
+      },
+      {
+        "command": "localai.generateTests",
+        "title": "LocalAI: Generate Unit Tests"
+      },
+      {
+        "command": "localai.addComments",
+        "title": "LocalAI: Add Comments & Docs"
+      },
+      {
+        "command": "localai.optimizeCode",
+        "title": "LocalAI: Optimize Code"
+      },
+      {
+        "command": "localai.generateCode",
+        "title": "LocalAI: Generate Code from Comment"
+      },
+      {
+        "command": "localai.askAboutSelection",
+        "title": "LocalAI: Ask About Selection"
+      },
+      {
+        "command": "localai.selectModel",
+        "title": "LocalAI: Select / Change Model",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "localai.checkConnection",
+        "title": "LocalAI: Check API Connection"
+      },
+      {
+        "command": "localai.acceptDiff",
+        "title": "LocalAI: Accept Pending Patch",
+        "icon": "$(check)",
+        "enablement": "localai.viewingDiff"
+      },
+      {
+        "command": "localai.rejectDiff",
+        "title": "LocalAI: Reject Pending Patch",
+        "icon": "$(discard)",
+        "enablement": "localai.viewingDiff"
+      },
+      {
+        "command": "localai.reviewDiff",
+        "title": "LocalAI: Review Pending Patch",
+        "icon": "$(diff)",
+        "enablement": "localai.viewingDiff"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "localai.openChat",
+        "key": "ctrl+shift+h",
+        "mac": "cmd+shift+h"
+      },
+      {
+        "command": "localai.explainCode",
+        "key": "ctrl+alt+h ctrl+alt+e",
+        "mac": "cmd+alt+h cmd+alt+e",
+        "when": "editorHasSelection"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localai-sidebar",
+          "title": "LocalAI Code",
+          "icon": "resources/icon-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "localai-sidebar": [
+        {
+          "type": "webview",
+          "id": "localai.chatView",
+          "name": "Chat",
+          "icon": "resources/icon-activity.svg"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "submenu": "localai.editorContext",
+          "group": "0_localai",
+          "when": "editorTextFocus"
+        }
+      ],
+      "localai.editorContext": [
+        {
+          "command": "localai.explainCode",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "localai.fixCode",
+          "group": "1_actions@2"
+        },
+        {
+          "command": "localai.refactorCode",
+          "group": "1_actions@3"
+        },
+        {
+          "command": "localai.optimizeCode",
+          "group": "1_actions@4"
+        },
+        {
+          "command": "localai.generateTests",
+          "group": "2_generate@1"
+        },
+        {
+          "command": "localai.addComments",
+          "group": "2_generate@2"
+        },
+        {
+          "command": "localai.askAboutSelection",
+          "group": "3_chat@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "localai.openChat",
+          "group": "navigation",
+          "when": "editorTextFocus"
+        }
+      ]
+    },
+    "submenus": [
+      {
+        "id": "localai.editorContext",
+        "label": "LocalAI Code ✨"
+      }
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.94.0"
+  }
+}
