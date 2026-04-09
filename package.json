@@ -306,7 +306,7 @@
         "localai.sandbox.autoStartDocker": {
           "type": "boolean",
           "default": true,
-          "description": "On Windows, try to launch Docker Desktop automatically when the extension opens or when tools first need the sandbox runtime.",
+          "description": "On Windows, try to launch Docker Desktop automatically only when a sandboxed tool first needs the runtime.",
           "order": 39
         },
         "localai.sandbox.image": {

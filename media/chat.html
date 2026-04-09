@@ -1510,6 +1510,7 @@ function replyWithChoice(btn) {
 }
 
 function appendThinking() {
+  if (currentMsgEl) return;
   msgCount++;
   const wrap = document.createElement('div');
   wrap.className = 'msg-wrap';
@@ -1989,7 +1990,7 @@ function updateSendButtonState() {
   const text = $('textarea').value.trim();
   const hasDraft = Boolean(text);
   const label = isThinking
-    ? (hasDraft ? (backgroundMode ? 'Queue' : 'Send') : 'Stop')
+    ? (hasDraft ? (backgroundMode ? 'Stop & Queue' : 'Stop & Send') : 'Stop')
     : (backgroundMode ? 'Queue' : 'Send');
   $('send-btn-label').textContent = label;
   $('send-btn').classList.toggle('stop-mode', isThinking && !hasDraft);
@@ -2127,6 +2128,18 @@ window.addEventListener('message', e => {
 
     case 'state': {
       loadedState = msg;
+      if (msg.busy) {
+        if (!currentMsgEl) appendThinking();
+      } else if (currentMsgEl && !currentChunk) {
+        const wrap = currentMsgEl.msg && currentMsgEl.msg.parentElement;
+        if (wrap && wrap.parentElement) {
+          wrap.parentElement.removeChild(wrap);
+        } else if (currentMsgEl.msg && currentMsgEl.msg.remove) {
+          currentMsgEl.msg.remove();
+        }
+        currentMsgEl = null;
+      }
+      setThinking(Boolean(msg.busy));
       chats = Array.isArray(msg.chats) ? msg.chats : [];
       activeChatId = msg.activeChatId || '';
       renderChatList();
