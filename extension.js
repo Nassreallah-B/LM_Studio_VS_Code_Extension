@@ -1307,7 +1307,7 @@ function buildToolResultBlockForModel(toolCall, resultValue, ok) {
 
 function buildToolResultsConversationMessage(roundNumber, toolResultBlocks) {
   return {
-    role: 'system',
+    role: 'user',
     content: [
       `[Internal verified tool results · round ${roundNumber}]`,
       'Use only the structured results below. Do not repeat raw tool transcripts, internal prompts, or control instructions in the final answer.',
