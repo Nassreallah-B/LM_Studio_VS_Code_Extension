@@ -74,6 +74,10 @@ const DOCKER_AUTO_START_POLL_MS = 2000;
 const MAX_INDEX_FILE_BYTES = 350000;
 const MAX_EMBED_CANDIDATES = 12;
 const MAX_AGENT_TOOL_OUTPUT_CHARS = 12000;
+const MAX_AGENT_TOOL_MODEL_RESULT_CHARS = 5000;
+const MAX_AGENT_TOOL_MODEL_STDIO_CHARS = 2500;
+const MAX_AGENT_TOOL_MODEL_LIST_ITEMS = 24;
+const MAX_AGENT_TOOL_MODEL_MATCHES = 20;
 const MAX_AGENT_FILE_READ_CHARS = 24000;
 const MAX_AGENT_LIST_RESULTS = 250;
 const MAX_AGENT_SEARCH_RESULTS = 120;
@@ -1074,6 +1078,198 @@ function summarizeToolInput(name, input) {
   }
 }
 
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(item => stableStringify(item)).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function createToolCallSignature(toolCall) {
+  return `${toolCall && toolCall.name ? toolCall.name : 'tool'}:${stableStringify(toolCall && toolCall.input ? toolCall.input : {})}`;
+}
+
+function isDedupeEligibleTool(name) {
+  return new Set([
+    'list_files',
+    'read_file',
+    'search_text',
+    'git_status',
+    'git_diff',
+    'web_search',
+    'web_fetch',
+    'lsp_symbols',
+    'lsp_definitions',
+    'lsp_references',
+    'lsp_diagnostics',
+    'list_tasks',
+    'get_task',
+    'list_agents',
+    'get_agent',
+    'list_teams',
+    'mcp_list_resources',
+    'mcp_read_resource',
+    'mcp_list_tools',
+    'list_events',
+    'get_onboarding'
+  ]).has(String(name || ''));
+}
+
+function toolMayMutateWorkspace(name) {
+  return new Set(['write_file', 'delete_path', 'run_shell']).has(String(name || ''));
+}
+
+function sanitizeAgentVisibleText(text) {
+  let value = String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  if (!value.trim()) return '';
+  value = value.replace(/\n?\[Tool results for round \d+\][\s\S]*?(?:Continue working\.[^\n]*|Use only the verified tool summaries below\.[^\n]*)/gi, '\n');
+  value = value.replace(/^\s*Continue working\..*$/gim, '');
+  value = value.replace(/^\s*If the task is complete, provide the final answer\..*$/gim, '');
+  value = value.replace(/^\s*Otherwise request (?:only )?the next missing tool call.*$/gim, '');
+  value = value.replace(/\n{3,}/g, '\n\n').trim();
+  return value;
+}
+
+function summarizeAssistantNoteForUi(note) {
+  const sanitized = sanitizeAgentVisibleText(note);
+  if (!sanitized) return '';
+  const flat = normalizeWhitespace(sanitized);
+  if (/^(?:i(?:'m| am)? going to|i will|let me|je vais(?: maintenant)?|maintenant je vais|je vais continuer|commençons par|on va commencer par)\b/i.test(flat)) {
+    return '';
+  }
+  return truncateText(sanitized, 220);
+}
+
+function formatJsonForModel(value, maxChars = MAX_AGENT_TOOL_MODEL_RESULT_CHARS) {
+  return truncateText(JSON.stringify(value, null, 2), maxChars);
+}
+
+function buildToolResultBlockForModel(toolCall, resultValue, ok) {
+  const name = toolCall && toolCall.name ? String(toolCall.name) : 'tool';
+  const input = toolCall && toolCall.input && typeof toolCall.input === 'object' ? toolCall.input : {};
+  if (!ok) {
+    return [
+      `Tool: ${name}`,
+      'Status: error',
+      `Error: ${truncateText(String(resultValue || 'unknown error'), 1600)}`
+    ].join('\n');
+  }
+
+  if (resultValue && resultValue.skipped && resultValue.duplicate) {
+    return [
+      `Tool: ${name}`,
+      'Status: duplicate skipped',
+      truncateText(String(resultValue.message || 'This exact read-only tool call was already executed earlier in the same task.'), 600)
+    ].join('\n');
+  }
+
+  switch (name) {
+    case 'read_file': {
+      const pathValue = resultValue && resultValue.path ? resultValue.path : (input.path || '');
+      const startLine = Number(resultValue && resultValue.startLine ? resultValue.startLine : (input.startLine || 1));
+      const endLine = Number(resultValue && resultValue.endLine ? resultValue.endLine : (input.endLine || startLine));
+      const totalLines = Number(resultValue && resultValue.totalLines ? resultValue.totalLines : endLine);
+      const content = truncateText(String((resultValue && resultValue.content) || ''), MAX_AGENT_TOOL_MODEL_RESULT_CHARS);
+      const note = content.length >= MAX_AGENT_TOOL_MODEL_RESULT_CHARS || endLine < totalLines
+        ? 'Note: this is a truncated excerpt. Request a narrower line range if more detail is needed.'
+        : '';
+      return [
+        'Tool: read_file',
+        `Path: ${pathValue}`,
+        `Lines: ${startLine}-${endLine} of ${totalLines}`,
+        note,
+        'Content excerpt:',
+        content
+      ].filter(Boolean).join('\n');
+    }
+
+    case 'list_files': {
+      const entries = Array.isArray(resultValue && resultValue.entries) ? resultValue.entries : [];
+      const sample = entries.slice(0, MAX_AGENT_TOOL_MODEL_LIST_ITEMS).map(entry => `- ${entry.type === 'directory' ? 'dir' : 'file'} ${entry.path}`);
+      const omitted = entries.length - sample.length;
+      return [
+        'Tool: list_files',
+        `Path: ${(resultValue && resultValue.path) || input.path || '.'}`,
+        `Count: ${entries.length}`,
+        sample.length ? `Entries:\n${sample.join('\n')}` : 'Entries: none',
+        omitted > 0 ? `Note: ${omitted} additional entries omitted.` : ''
+      ].filter(Boolean).join('\n');
+    }
+
+    case 'search_text': {
+      const matches = Array.isArray(resultValue && resultValue.matches) ? resultValue.matches : [];
+      const sample = matches.slice(0, MAX_AGENT_TOOL_MODEL_MATCHES).map(match => `- ${match.path}:${match.line} ${truncateText(match.preview || '', 180)}`);
+      const omitted = matches.length - sample.length;
+      return [
+        'Tool: search_text',
+        `Pattern: ${input.pattern || (resultValue && resultValue.pattern) || ''}`,
+        `Matches: ${matches.length}`,
+        sample.length ? `Top matches:\n${sample.join('\n')}` : 'Top matches: none',
+        omitted > 0 ? `Note: ${omitted} additional matches omitted.` : ''
+      ].filter(Boolean).join('\n');
+    }
+
+    case 'run_shell': {
+      const exitCode = resultValue && resultValue.exitCode != null ? resultValue.exitCode : 0;
+      const stdout = truncateText(String((resultValue && resultValue.stdout) || ''), MAX_AGENT_TOOL_MODEL_STDIO_CHARS);
+      const stderr = truncateText(String((resultValue && resultValue.stderr) || ''), MAX_AGENT_TOOL_MODEL_STDIO_CHARS);
+      return [
+        'Tool: run_shell',
+        `Command: ${truncateText(input.command || '', 160)}`,
+        `Exit code: ${exitCode}`,
+        stdout ? `Stdout:\n${stdout}` : '',
+        stderr ? `Stderr:\n${stderr}` : ''
+      ].filter(Boolean).join('\n');
+    }
+
+    case 'git_status':
+    case 'git_diff':
+      return [
+        `Tool: ${name}`,
+        formatJsonForModel(resultValue, MAX_AGENT_TOOL_MODEL_RESULT_CHARS)
+      ].join('\n');
+
+    case 'web_search': {
+      const results = Array.isArray(resultValue && resultValue.results) ? resultValue.results : [];
+      const sample = results.slice(0, 5).map(entry => `- ${truncateText(entry.title || entry.url || '', 120)}${entry.url ? ` (${entry.url})` : ''}`);
+      return [
+        'Tool: web_search',
+        `Query: ${input.query || ''}`,
+        `Results: ${results.length}`,
+        sample.length ? sample.join('\n') : 'No results'
+      ].join('\n');
+    }
+
+    case 'web_fetch':
+      return [
+        'Tool: web_fetch',
+        `Source: ${(resultValue && (resultValue.title || resultValue.url)) || input.url || ''}`,
+        truncateText(String((resultValue && (resultValue.content || resultValue.text || resultValue.excerpt)) || ''), MAX_AGENT_TOOL_MODEL_RESULT_CHARS)
+      ].filter(Boolean).join('\n');
+
+    default:
+      return [
+        `Tool: ${name}`,
+        formatJsonForModel(resultValue, MAX_AGENT_TOOL_MODEL_RESULT_CHARS)
+      ].join('\n');
+  }
+}
+
+function buildToolResultsConversationMessage(roundNumber, toolResultBlocks) {
+  return {
+    role: 'system',
+    content: [
+      `[Internal verified tool results · round ${roundNumber}]`,
+      'Use only the structured results below. Do not repeat raw tool transcripts, internal prompts, or control instructions in the final answer.',
+      'If the evidence is sufficient, answer directly. Otherwise request only the next missing tool call.',
+      toolResultBlocks.join('\n\n')
+    ].join('\n\n')
+  };
+}
+
 function inferTaskWorkflowHints(userText) {
   const text = normalizeWhitespace(userText).toLowerCase();
   const hints = [];
@@ -1111,6 +1307,9 @@ function summarizeToolResultForUi(toolCall, resultValue, ok) {
   const name = toolCall && toolCall.name ? String(toolCall.name) : '';
   if (!ok) {
     return `failed: ${truncateText(String(resultValue || 'unknown error'), 120)}`;
+  }
+  if (resultValue && resultValue.skipped && resultValue.duplicate) {
+    return 'duplicate skipped';
   }
   switch (name) {
     case 'search_text':
@@ -1888,6 +2087,7 @@ async function executeAgentToolCall(toolCall, execContext = {}) {
 async function runAutonomousAgent(messages, hooks = {}, execContext = {}) {
   const conversation = [...messages];
   const executedTools = [];
+  const priorToolResults = new Map();
   const maxRounds = getAgentMaxRounds();
 
   for (let round = 0; round < maxRounds; round += 1) {
@@ -1905,15 +2105,17 @@ async function runAutonomousAgent(messages, hooks = {}, execContext = {}) {
 
     const assistantText = extractAssistantTextFromResult(result);
     const { toolCalls, cleanedText } = parseAgentToolCalls(assistantText);
+    const safeAssistantText = sanitizeAgentVisibleText(assistantText) || assistantText;
+    const safeCleanedText = sanitizeAgentVisibleText(cleanedText);
 
     if (!toolCalls.length) {
       conversation.push({
         role: 'assistant',
-        content: assistantText
+        content: safeAssistantText
       });
       if (hooks.onConversationUpdate) hooks.onConversationUpdate(cloneMessages(conversation), round + 1);
       return {
-        finalText: assistantText,
+        finalText: safeAssistantText,
         executedTools,
         rounds: round + 1,
         conversation: cloneMessages(conversation)
@@ -1922,12 +2124,13 @@ async function runAutonomousAgent(messages, hooks = {}, execContext = {}) {
 
     conversation.push({
       role: 'assistant',
-      content: cleanedText || `Using ${toolCalls.length} tool(s).`
+      content: safeCleanedText || `Using ${toolCalls.length} tool(s).`
     });
     if (hooks.onConversationUpdate) hooks.onConversationUpdate(cloneMessages(conversation), round + 1);
 
-    if (hooks.onAssistantNote && cleanedText) {
-      hooks.onAssistantNote(cleanedText, round + 1);
+    const noteForUi = summarizeAssistantNoteForUi(safeCleanedText);
+    if (hooks.onAssistantNote && noteForUi) {
+      hooks.onAssistantNote(noteForUi, round + 1);
     }
 
     const toolResultBlocks = [];
@@ -1937,32 +2140,39 @@ async function runAutonomousAgent(messages, hooks = {}, execContext = {}) {
       }
 
       if (hooks.onToolCall) hooks.onToolCall(toolCall, round + 1);
+      const toolSignature = createToolCallSignature(toolCall);
+      if (isDedupeEligibleTool(toolCall.name) && priorToolResults.has(toolSignature)) {
+        const duplicateResult = {
+          skipped: true,
+          duplicate: true,
+          message: 'This exact read-only tool call was already executed earlier in the same task. Reuse the previous result or request a narrower follow-up.'
+        };
+        executedTools.push({ name: toolCall.name, input: toolCall.input, ok: true, skipped: true, duplicate: true });
+        toolResultBlocks.push(buildToolResultBlockForModel(toolCall, duplicateResult, true));
+        if (hooks.onToolResult) hooks.onToolResult(toolCall, duplicateResult, true, round + 1);
+        continue;
+      }
       try {
         const resultValue = await executeAgentToolCall(toolCall, execContext);
         executedTools.push({ name: toolCall.name, input: toolCall.input, ok: true });
-        const formatted = JSON.stringify(resultValue, null, 2);
-        toolResultBlocks.push(
-          `Tool: ${toolCall.name}\nInput:\n${JSON.stringify(toolCall.input, null, 2)}\nResult:\n${truncateText(formatted, MAX_AGENT_TOOL_OUTPUT_CHARS)}`
-        );
+        const compactBlock = buildToolResultBlockForModel(toolCall, resultValue, true);
+        toolResultBlocks.push(compactBlock);
+        if (isDedupeEligibleTool(toolCall.name)) {
+          priorToolResults.set(toolSignature, compactBlock);
+        }
+        if (toolMayMutateWorkspace(toolCall.name)) {
+          priorToolResults.clear();
+        }
         if (hooks.onToolResult) hooks.onToolResult(toolCall, resultValue, true, round + 1);
       } catch (error) {
         const errorText = error instanceof Error ? error.message : String(error);
         executedTools.push({ name: toolCall.name, input: toolCall.input, ok: false, error: errorText });
-        toolResultBlocks.push(
-          `Tool: ${toolCall.name}\nInput:\n${JSON.stringify(toolCall.input, null, 2)}\nError:\n${truncateText(errorText, 4000)}`
-        );
+        toolResultBlocks.push(buildToolResultBlockForModel(toolCall, errorText, false));
         if (hooks.onToolResult) hooks.onToolResult(toolCall, errorText, false, round + 1);
       }
     }
 
-    conversation.push({
-      role: 'user',
-      content: [
-        `[Tool results for round ${round + 1}]`,
-        toolResultBlocks.join('\n\n'),
-        'Continue working. If the task is complete, provide the final answer. Otherwise request more tools with <localai-tool> tags.'
-      ].join('\n\n')
-    });
+    conversation.push(buildToolResultsConversationMessage(round + 1, toolResultBlocks));
     if (hooks.onConversationUpdate) hooks.onConversationUpdate(cloneMessages(conversation), round + 1);
   }
 
@@ -3963,6 +4173,7 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
   execContext.chatId = task.chatId || '';
   const maxRounds = Math.max(1, Math.min(12, Number(task.maxRounds || getAgentMaxRounds())));
   const executedTools = [];
+  const priorToolResults = new Map();
 
   for (;;) {
     task = runtime.store.loadTask(taskId);
@@ -4043,9 +4254,11 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
       });
       const assistantText = extractAssistantTextFromResult(result);
       const { toolCalls, cleanedText } = parseAgentToolCalls(assistantText);
+      const safeAssistantText = sanitizeAgentVisibleText(assistantText) || assistantText;
+      const safeCleanedText = sanitizeAgentVisibleText(cleanedText);
 
       if (!toolCalls.length) {
-        conversation.push({ role: 'assistant', content: assistantText });
+        conversation.push({ role: 'assistant', content: safeAssistantText });
         runtime.store.updateTask(taskId, currentTask => {
           currentTask.rounds = round;
           currentTask.messages = cloneMessages(conversation);
@@ -4063,7 +4276,7 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
         });
         if (liveHooks.onConversationUpdate) liveHooks.onConversationUpdate(cloneMessages(conversation), round);
         return {
-          finalText: assistantText,
+          finalText: safeAssistantText,
           conversation,
           executedTools,
           rounds: round
@@ -4072,7 +4285,7 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
 
       conversation.push({
         role: 'assistant',
-        content: cleanedText || `Using ${toolCalls.length} tool(s).`
+        content: safeCleanedText || `Using ${toolCalls.length} tool(s).`
       });
       runtime.store.updateTask(taskId, currentTask => {
         currentTask.rounds = round;
@@ -4090,7 +4303,8 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
         return currentTask;
       });
       if (liveHooks.onConversationUpdate) liveHooks.onConversationUpdate(cloneMessages(conversation), round);
-      if (cleanedText && liveHooks.onAssistantNote) liveHooks.onAssistantNote(cleanedText, round);
+      const noteForUi = summarizeAssistantNoteForUi(safeCleanedText);
+      if (noteForUi && liveHooks.onAssistantNote) liveHooks.onAssistantNote(noteForUi, round);
       pendingToolCalls = toolCalls;
     }
 
@@ -4098,8 +4312,33 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
       const toolCall = pendingToolCalls[index];
       if (runtimeState.stopRequested) throw new Error('Task stopped by user.');
       if (liveHooks.onToolCall) liveHooks.onToolCall(toolCall, round);
+      const toolSignature = createToolCallSignature(toolCall);
       let ok = true;
       let resultValue = null;
+      if (isDedupeEligibleTool(toolCall.name) && priorToolResults.has(toolSignature)) {
+        resultValue = {
+          skipped: true,
+          duplicate: true,
+          message: 'This exact read-only tool call was already executed earlier in the same task. Reuse the previous result or request a narrower follow-up.'
+        };
+        executedTools.push({ name: toolCall.name, input: toolCall.input, ok: true, skipped: true, duplicate: true });
+        toolResultBlocks.push(buildToolResultBlockForModel(toolCall, resultValue, true));
+        runtime.store.updateTask(taskId, currentTask => {
+          currentTask.checkpointAt = new Date().toISOString();
+          currentTask.checkpoint = {
+            phase: 'executing_tools',
+            round,
+            conversation: cloneMessages(conversation),
+            pendingToolCalls,
+            nextToolIndex: index + 1,
+            toolResultBlocks: [...toolResultBlocks],
+            gitRef: currentTask.checkpoint && currentTask.checkpoint.gitRef ? currentTask.checkpoint.gitRef : ''
+          };
+          return currentTask;
+        });
+        if (liveHooks.onToolResult) liveHooks.onToolResult(toolCall, resultValue, true, round);
+        continue;
+      }
       try {
         runtime.features.appendEvent('tool.called', { tool: toolCall.name, taskId, agentId: task.agentId || '' });
         resultValue = await executeAgentToolCall(toolCall, execContext);
@@ -4111,14 +4350,16 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
       }
       runtime.features.appendEvent(ok ? 'tool.completed' : 'tool.failed', { tool: toolCall.name, taskId, agentId: task.agentId || '' }, ok ? 'info' : 'audit');
 
-      const detail = ok
-        ? JSON.stringify(resultValue, null, 2)
-        : String(resultValue);
-      toolResultBlocks.push(
-        ok
-          ? `Tool: ${toolCall.name}\nInput:\n${JSON.stringify(toolCall.input, null, 2)}\nResult:\n${truncateText(detail, MAX_AGENT_TOOL_OUTPUT_CHARS)}`
-          : `Tool: ${toolCall.name}\nInput:\n${JSON.stringify(toolCall.input, null, 2)}\nError:\n${truncateText(detail, 4000)}`
-      );
+      const compactBlock = ok
+        ? buildToolResultBlockForModel(toolCall, resultValue, true)
+        : buildToolResultBlockForModel(toolCall, resultValue, false);
+      toolResultBlocks.push(compactBlock);
+      if (ok && isDedupeEligibleTool(toolCall.name)) {
+        priorToolResults.set(toolSignature, compactBlock);
+      }
+      if (ok && toolMayMutateWorkspace(toolCall.name)) {
+        priorToolResults.clear();
+      }
 
       let gitRef = '';
       if (execContext.sandboxMeta) {
@@ -4166,14 +4407,7 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
       }
     }
 
-    conversation.push({
-      role: 'user',
-      content: [
-        `[Tool results for round ${round}]`,
-        toolResultBlocks.join('\n\n'),
-        'Continue working. If the task is complete, provide the final answer. Otherwise request more tools with <localai-tool> tags.'
-      ].join('\n\n')
-    });
+    conversation.push(buildToolResultsConversationMessage(round, toolResultBlocks));
     runtime.store.updateTask(taskId, currentTask => {
       currentTask.messages = cloneMessages(conversation);
       currentTask.checkpointAt = new Date().toISOString();
@@ -4690,14 +4924,15 @@ class AgentTaskManager {
           if (chatProvider && chatProvider.syncState) chatProvider.syncState();
         },
         onAssistantNote: (note) => {
-          if (note) {
-            this.runtime.store.appendTaskLog(taskId, `Assistant note: ${truncateText(note, 220)}`);
+          const visibleNote = summarizeAssistantNoteForUi(note);
+          if (visibleNote) {
+            this.runtime.store.appendTaskLog(taskId, `Assistant note: ${truncateText(visibleNote, 220)}`);
             this.runtime.store.updateTask(taskId, currentTask => {
-              currentTask.progressSummary = truncateText(normalizeWhitespace(note), 180);
+              currentTask.progressSummary = truncateText(normalizeWhitespace(visibleNote), 180);
               return currentTask;
             });
           }
-          if (liveHooks.onAssistantNote) liveHooks.onAssistantNote(note);
+          if (visibleNote && liveHooks.onAssistantNote) liveHooks.onAssistantNote(visibleNote);
           if (chatProvider && chatProvider.syncState) chatProvider.syncState();
         },
         onConversationUpdate: (conversation) => {
@@ -5636,7 +5871,8 @@ class LocalAIChatViewProvider {
             this._post({ type: 'systemMsg', text: `Agent round ${round}/${maxRounds}` });
           },
           onAssistantNote: (note) => {
-            if (note) this._post({ type: 'systemMsg', text: truncateText(note, 220) });
+            const visibleNote = summarizeAssistantNoteForUi(note);
+            if (visibleNote) this._post({ type: 'systemMsg', text: visibleNote });
           },
           onToolCall: (toolCall) => {
             this._post({ type: 'systemMsg', text: `Tool: ${summarizeToolInput(toolCall.name, toolCall.input)}` });

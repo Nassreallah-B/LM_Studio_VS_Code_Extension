@@ -24,6 +24,7 @@
 - Added publication hardening for packaging and secrets hygiene.
 - Added `LICENSE`.
 - Cleaned README packaging issues so `vsce package` now completes.
+- Added [TODO.md](/C:/Serveurs/LM_Studio_VS_Code_Extension/TODO.md) to track the remaining priorities: secure provider secret handling parity, live-test cleanup, CI, stronger claim validation, broader tests, and a dedicated activity-bar icon.
 - Remaining metadata step:
   - repository URL for `localai-code-1.0.0`
   - homepage URL for `localai-code-1.0.0`
