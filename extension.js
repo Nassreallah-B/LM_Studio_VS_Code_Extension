@@ -8,6 +8,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { DockerSandboxManager } = require('./lib/dockerSandbox');
+const antiHallucination = require('./lib/antiHallucination');
 const {
   AGENT_TYPE_CATALOG,
   ADVANCED_AGENT_TOOL_SPECS,
@@ -67,6 +68,9 @@ const DEFAULT_SANDBOX_IMAGE = 'localai-code-sandbox:latest';
 const DEFAULT_SANDBOX_NETWORK = 'none';
 const DEFAULT_SANDBOX_MAX_CONCURRENT = 2;
 const DEFAULT_SANDBOX_TOOL_TIMEOUT_MS = 120000;
+const DOCKER_AUTO_START_READY_TIMEOUT_MS = 45000;
+const DOCKER_AUTO_START_COOLDOWN_MS = 30000;
+const DOCKER_AUTO_START_POLL_MS = 2000;
 const MAX_INDEX_FILE_BYTES = 350000;
 const MAX_EMBED_CANDIDATES = 12;
 const MAX_AGENT_TOOL_OUTPUT_CHARS = 12000;
@@ -167,6 +171,27 @@ const CLOUD_RUNTIME_SYSTEM_INSTRUCTIONS = [
   'Prefer tool tags over guessing, and do not claim that you cannot access or modify files in the task workspace.',
   'Shell commands, file reads, searches, and file writes happen remotely inside that isolated workspace.'
 ].join('\n');
+const ANTI_HALLUCINATION_SYSTEM_INSTRUCTIONS = [
+  'Never present an unverified claim as established fact.',
+  'When the task is analytical, technical, or audit-oriented, explicitly distinguish: CONFIRMED, PROBABLE, UNCERTAIN, NON-VERIFIED, or FALSE.',
+  'Documentation alone is not proof of implementation.',
+  'A TODO, commented config, named file, unexecuted script, isolated test, or placeholder is not proof that a feature works.',
+  'Distinguish clearly between: existing code, missing code, broken code, dead code, documentation, future intent, inactive configuration, and configuration proven active.',
+  'If a point cannot be verified from the available code, files, logs, commands, or test outputs, say: "I cannot confirm this point with the available evidence."',
+  'When auditing a project, cite exact evidence when available: file path, function name, command output, test result, or log origin.',
+  'Do not invent numeric scores unless the scoring method is explicit and each sub-score is justified.',
+  'If you detect a contradiction between documentation and code, call it out immediately.',
+  'For recommendations, be concrete, applicable, project-specific, prioritized, and justified by real impact.',
+  'For improvement proposals, separate quick wins, medium efforts, and heavy efforts, and avoid decorative recommendations.',
+  'For code or file creation tasks, analyze the existing architecture first, identify the real files to change, reuse what already exists when possible, avoid duplication, state assumptions explicitly, and produce maintainable output.',
+  'Prefer modifying the existing implementation cleanly over creating duplicate modules, layers, or APIs.',
+  'Do not present a result as complete, production-ready, secure, scalable, robust, or finished without technical proof.',
+  'Prefer simple, readable, testable code over premature abstraction, hidden hacks, or unnecessary dependencies.',
+  'When proposing code, consider validation, authentication, authorization, secret handling, injection risk, XSS, CSRF, SSRF, path traversal, open redirect, dangerous deserialization, rate limits, sensitive logging, webhook verification, replay protection, timeout behavior, fail-open versus fail-closed, and minimum privileges when applicable.',
+  'Never hardcode a secret, expose a token in frontend code, trust client input blindly, return sensitive stack traces to clients, use eval carelessly, build shell execution from unsafe input, concatenate unparameterized SQL, or log passwords, tokens, cookies, OTPs, or API keys.',
+  'If runtime execution was not verified, say whether it is present in code, non-executed, non-validated in runtime, or non-confirmed in production.'
+].join('\n');
+
 const AGENT_EXECUTION_PLAYBOOK = [
   'Default execution playbook:',
   '1. Ground yourself in the workspace first with read_file, search_text, list_files, LSP tools, and existing tests before editing.',
@@ -359,6 +384,10 @@ function sandboxAutoBuildImage() {
   return cfg('sandbox.autoBuildImage') !== false;
 }
 
+function sandboxAutoStartDocker() {
+  return cfg('sandbox.autoStartDocker') !== false;
+}
+
 function getSandboxNetworkMode() {
   return String(cfg('sandbox.networkMode') || DEFAULT_SANDBOX_NETWORK).trim() || DEFAULT_SANDBOX_NETWORK;
 }
@@ -373,6 +402,16 @@ function getSandboxToolTimeoutMs() {
 
 function sandboxRetainOnFailure() {
   return cfg('sandbox.retainOnFailure') !== false;
+}
+
+function getDockerDesktopExecutableCandidates() {
+  const candidates = [
+    process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Docker', 'Docker', 'Docker Desktop.exe') : '',
+    process.env.ProgramW6432 ? path.join(process.env.ProgramW6432, 'Docker', 'Docker', 'Docker Desktop.exe') : '',
+    process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], 'Docker', 'Docker', 'Docker Desktop.exe') : '',
+    process.env.LocalAppData ? path.join(process.env.LocalAppData, 'Docker', 'Docker Desktop.exe') : ''
+  ];
+  return [...new Set(candidates.filter(Boolean).map(candidate => path.normalize(candidate)))];
 }
 
 function hashText(text) {
@@ -909,6 +948,7 @@ function getAgentSystemPrompt(options = {}) {
   if (runtimeKind === 'cloud') {
     sections.push(CLOUD_RUNTIME_SYSTEM_INSTRUCTIONS);
   }
+  sections.push(ANTI_HALLUCINATION_SYSTEM_INSTRUCTIONS);
   sections.push(WORKSPACE_ACTION_INSTRUCTIONS);
 
   if (agentEnabled() && enableTools) {
@@ -942,6 +982,26 @@ function rewriteMessagesForRuntime(messages, runtimeKind, options = {}) {
     };
   }
   return nextMessages;
+}
+
+function classifyRequestIntent(text) {
+  return antiHallucination.classifyRequestIntent(text);
+}
+
+function buildIntentFormatInstructions(intent, options = {}) {
+  return antiHallucination.buildIntentFormatInstructions(intent, options);
+}
+
+function injectIntentFormatInstructions(messages, userText, contextMeta = null) {
+  return antiHallucination.injectIntentFormatInstructions(messages, userText, { contextMeta });
+}
+
+function postValidateAssistantResponse(text, options = {}) {
+  return antiHallucination.postValidateAssistantResponse(text, options);
+}
+
+function buildResponseMeta(intentContext, validation, extras = {}) {
+  return antiHallucination.buildResponseMeta(intentContext, validation, extras);
 }
 
 function parseAssistantActions(text) {
@@ -2951,6 +3011,8 @@ class LocalAIRuntime {
     this.readyPromise = null;
     this.compactingChats = new Set();
     this.contextMetaByChat = new Map();
+    this._lastDockerAutoStartAt = 0;
+    this._lastDockerAutoStartResult = null;
   }
 
   async initialize() {
@@ -2961,6 +3023,7 @@ class LocalAIRuntime {
         await this.rag.initialize();
         await this.tasks.initialize();
         await this.refreshRuntimeContexts();
+        void this.maybeAutoStartDocker({ reason: 'activation', waitForReady: false });
       })();
     }
     return this.readyPromise;
@@ -2969,6 +3032,119 @@ class LocalAIRuntime {
   async refreshRuntimeContexts() {
     await vscode.commands.executeCommand('setContext', 'localai.viewingDiff', this.store.getPendingPatches().length > 0);
     await vscode.commands.executeCommand('setContext', 'localai.pendingQuestion', Boolean(this.features.getSnapshot().pendingQuestions.length));
+  }
+
+  async _waitForDockerReady(timeoutMs = DOCKER_AUTO_START_READY_TIMEOUT_MS) {
+    const deadline = Date.now() + Math.max(DOCKER_AUTO_START_POLL_MS, Number(timeoutMs) || DOCKER_AUTO_START_READY_TIMEOUT_MS);
+    while (Date.now() < deadline) {
+      const health = await this.sandbox.getHealth(true);
+      if (health.dockerReady) return health;
+      await new Promise(resolve => setTimeout(resolve, DOCKER_AUTO_START_POLL_MS));
+    }
+    return null;
+  }
+
+  async maybeAutoStartDocker(options = {}) {
+    const reason = String(options.reason || 'runtime');
+    const waitForReady = options.waitForReady === true;
+    const skippedResult = {
+      attempted: false,
+      launched: false,
+      ready: false,
+      reason,
+      detail: ''
+    };
+
+    if (!sandboxEnabled() || !sandboxAutoStartDocker() || process.platform !== 'win32') {
+      return skippedResult;
+    }
+
+    const initialHealth = await this.sandbox.getHealth(false);
+    if (initialHealth.dockerReady) {
+      const result = {
+        attempted: false,
+        launched: false,
+        ready: true,
+        reason,
+        detail: 'Docker is already ready.'
+      };
+      this._lastDockerAutoStartResult = result;
+      return result;
+    }
+
+    const now = Date.now();
+    const inCooldown = this._lastDockerAutoStartAt && (now - this._lastDockerAutoStartAt) < DOCKER_AUTO_START_COOLDOWN_MS;
+    if (inCooldown) {
+      const readyHealth = waitForReady ? await this._waitForDockerReady() : null;
+      const result = {
+        attempted: true,
+        launched: false,
+        ready: Boolean(readyHealth && readyHealth.dockerReady),
+        reason,
+        detail: readyHealth && readyHealth.dockerReady
+          ? 'Docker became ready after a recent auto-start request.'
+          : 'Docker auto-start was already requested recently.'
+      };
+      this._lastDockerAutoStartResult = result;
+      return result;
+    }
+
+    const dockerDesktopPath = getDockerDesktopExecutableCandidates().find(candidate => {
+      try {
+        return fs.existsSync(candidate);
+      } catch (_) {
+        return false;
+      }
+    });
+    if (!dockerDesktopPath) {
+      const result = {
+        attempted: true,
+        launched: false,
+        ready: false,
+        reason,
+        detail: 'Docker Desktop executable was not found on this machine.'
+      };
+      this._lastDockerAutoStartAt = now;
+      this._lastDockerAutoStartResult = result;
+      console.warn(`[localai-code] Docker auto-start skipped (${reason}): ${result.detail}`);
+      return result;
+    }
+
+    try {
+      const child = spawn(dockerDesktopPath, [], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true
+      });
+      child.unref();
+      this._lastDockerAutoStartAt = now;
+      const readyHealth = waitForReady ? await this._waitForDockerReady() : null;
+      const result = {
+        attempted: true,
+        launched: true,
+        ready: Boolean(readyHealth && readyHealth.dockerReady),
+        reason,
+        detail: readyHealth && readyHealth.dockerReady
+          ? 'Docker Desktop was launched and the daemon is ready.'
+          : 'Docker Desktop launch was requested. The daemon may still be starting.'
+      };
+      this._lastDockerAutoStartResult = result;
+      console.log(`[localai-code] Docker auto-start (${reason}): ${result.detail}`);
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const result = {
+        attempted: true,
+        launched: false,
+        ready: false,
+        reason,
+        detail: `Failed to launch Docker Desktop: ${message}`
+      };
+      this._lastDockerAutoStartAt = now;
+      this._lastDockerAutoStartResult = result;
+      console.warn(`[localai-code] Docker auto-start failed (${reason}): ${message}`);
+      return result;
+    }
   }
 
   async getSandboxStatus(force = false) {
@@ -2981,7 +3157,8 @@ class LocalAIRuntime {
       ok: Boolean(health.ok && (!sandboxEnabled() || health.imageReady || sandboxAutoBuildImage())),
       image: health.image,
       networkMode: health.networkMode,
-      detail: health.detail || '',
+      autoStart: this._lastDockerAutoStartResult ? { ...this._lastDockerAutoStartResult } : null,
+      detail: health.detail || (this._lastDockerAutoStartResult && this._lastDockerAutoStartResult.detail) || '',
       checkedAt: new Date(health.checkedAt || Date.now()).toISOString()
     };
   }
@@ -2991,6 +3168,7 @@ class LocalAIRuntime {
       throw new Error('Sandboxed agent execution is disabled in settings.');
     }
     try {
+      await this.maybeAutoStartDocker({ reason: 'ensure-sandbox', waitForReady: true });
       await this.sandbox.ensureReady();
       return this.getSandboxStatus(true);
     } catch (error) {
@@ -4561,7 +4739,14 @@ class AgentTaskManager {
       }
 
       const { actions, cleanedText } = parseAssistantActions(taskResult.finalText || '');
-      const finalText = cleanedText || taskResult.finalText || '';
+      const rawFinalText = cleanedText || taskResult.finalText || '';
+      const taskIntentContext = injectIntentFormatInstructions(
+        taskResult.conversation || task.messages || [],
+        task.prompt || '',
+        task.chatId ? this.runtime.getContextMeta(task.chatId) : null
+      );
+      const validatedTaskResult = postValidateAssistantResponse(rawFinalText, taskIntentContext);
+      const finalText = validatedTaskResult.text;
       let patch = null;
       const latestTask = this.runtime.store.loadTask(taskId);
       if (latestTask && latestTask.sandboxId) {
@@ -4591,6 +4776,11 @@ class AgentTaskManager {
         currentTask.messages = cloneMessages(taskResult.conversation || currentTask.messages);
         currentTask.resultText = finalText;
         currentTask.resultPreview = truncateText(normalizeWhitespace(finalText), 220);
+        currentTask.responseIntent = taskIntentContext.intent || '';
+        currentTask.strictAuditMode = Boolean(taskIntentContext.strictAuditMode);
+        currentTask.availableEvidenceSummary = taskIntentContext.evidenceSummary || '';
+        currentTask.postValidationStatus = validatedTaskResult.validation.status;
+        currentTask.postValidationIssues = Array.isArray(validatedTaskResult.validation.issues) ? validatedTaskResult.validation.issues : [];
         currentTask.error = '';
         currentTask.checkpointAt = new Date().toISOString();
         currentTask.checkpoint = {
@@ -4979,6 +5169,7 @@ class LocalAIChatViewProvider {
     this._streaming = false;
     this._abortActiveStream = null;
     this._activeForegroundTaskId = '';
+    this._responseMetaByChatId = new Map();
   }
 
   async syncState() {
@@ -5011,6 +5202,7 @@ class LocalAIChatViewProvider {
         globalMemoryCount: snapshot.globalMemoryCount
       },
       instructionStatus: appRuntime.getInstructionStatus(activeChatId),
+      responseMeta: activeChatId ? this._getResponseMeta(activeChatId) : null,
       connected: isConnected,
       model: getModelId(),
       baseUrl: getBaseUrl(),
@@ -5158,6 +5350,36 @@ class LocalAIChatViewProvider {
     if (this._view) this._view.webview.postMessage(msg);
   }
 
+  _setResponseMeta(chatId, meta) {
+    if (!chatId) return;
+    if (!meta) {
+      this._responseMetaByChatId.delete(chatId);
+      return;
+    }
+    this._responseMetaByChatId.set(chatId, { ...meta });
+  }
+
+  _getResponseMeta(chatId) {
+    return chatId ? (this._responseMetaByChatId.get(chatId) || null) : null;
+  }
+
+  _logAuditDecision(chatId, meta) {
+    if (!meta) return;
+    console.info('[localai-code] intent=' + (meta.intent || 'general') + ' strict=' + (meta.strictAuditMode ? 'on' : 'off') + ' validation=' + (meta.postValidationStatus || 'pending') + ' chat=' + (chatId || 'none'));
+  }
+
+  _finalizeAssistantResponse(chatId, assistantText, intentContext = {}, extras = {}) {
+    const finalized = postValidateAssistantResponse(assistantText, intentContext);
+    const meta = buildResponseMeta(intentContext, finalized.validation, extras);
+    this._setResponseMeta(chatId, meta);
+    this._logAuditDecision(chatId, meta);
+    return {
+      text: finalized.text,
+      validation: finalized.validation,
+      meta
+    };
+  }
+
   async _onReady() {
     await appRuntime.initialize();
     await checkConnection();
@@ -5207,6 +5429,7 @@ class LocalAIChatViewProvider {
   }
 
   async _runDirectChatFallback(activeChat, messages, reasonText = '', options = {}) {
+    const responseContext = options.intentContext || { intent: '', strictAuditMode: false, evidenceSummary: '' };
     const directMessages = rewriteMessagesForRuntime(messages, options.runtimeKind || 'local', {
       chatId: activeChat.id,
       store: appRuntime.store,
@@ -5231,7 +5454,12 @@ class LocalAIChatViewProvider {
         }
       });
       const { actions, cleanedText } = parseAssistantActions(assistantText);
-      const finalText = cleanedText || (actions.length ? 'Prepared workspace changes.' : assistantText);
+      const rawFinalText = cleanedText || (actions.length ? 'Prepared workspace changes.' : assistantText);
+      const finalized = this._finalizeAssistantResponse(activeChat.id, rawFinalText, responseContext, {
+        source: 'direct-chat',
+        runtimeKind: options.runtimeKind || 'local'
+      });
+      const finalText = finalized.text;
       let patch = null;
       if (actions.length) {
         patch = await appRuntime.createPatchFromAssistantActions(actions, {
@@ -5312,6 +5540,15 @@ class LocalAIChatViewProvider {
       await this.syncState();
       return;
     }
+    const contextMetaForIntent = appRuntime.getContextMeta(activeChat.id);
+    const intentContext = injectIntentFormatInstructions(messages, userText, contextMetaForIntent);
+    messages = intentContext.messages;
+    this._setResponseMeta(activeChat.id, buildResponseMeta(intentContext, { status: 'pending', issues: [] }, {
+      source: background ? 'background' : 'foreground',
+      phase: 'preparing'
+    }));
+    this._logAuditDecision(activeChat.id, this._getResponseMeta(activeChat.id));
+    await this.syncState();
 
     if (background) {
       if (!agentEnabled()) {
@@ -5327,7 +5564,7 @@ class LocalAIChatViewProvider {
             activeChat,
             messages,
             `${describeSandboxBypass(sandboxStatus, fallback)} Background agent mode needs tools.`,
-            { showThinking: false }
+            { showThinking: false, intentContext }
           );
           return;
         }
@@ -5336,7 +5573,8 @@ class LocalAIChatViewProvider {
         await this._runDirectChatFallback(
           activeChat,
           messages,
-          `${fallback.userMessage} Background agent mode needs Docker.`
+          `${fallback.userMessage} Background agent mode needs Docker.`,
+          { intentContext }
         );
         return;
       }
@@ -5369,7 +5607,7 @@ class LocalAIChatViewProvider {
               activeChat,
               messages,
               describeSandboxBypass(sandboxStatus, fallback),
-              { showThinking: false }
+              { showThinking: false, intentContext }
             );
             return;
           }
@@ -5379,7 +5617,7 @@ class LocalAIChatViewProvider {
             activeChat,
             messages,
             `${fallback.userMessage} Open Docker Desktop to re-enable tools.`,
-            { showThinking: false }
+            { showThinking: false, intentContext }
           );
           return;
         }
@@ -5410,12 +5648,23 @@ class LocalAIChatViewProvider {
             this._post({ type: 'systemMsg', text: `Patch ready: ${formatPatchSummary(patch.files, patch.summary)}. Accept it to write the files into the workspace.` });
           }
         });
+        const completedTaskBeforeDelivery = appRuntime.store.loadTask(preparedTask.id);
+        const agentValidation = {
+          status: completedTaskBeforeDelivery && completedTaskBeforeDelivery.postValidationStatus ? completedTaskBeforeDelivery.postValidationStatus : 'passed',
+          issues: completedTaskBeforeDelivery && Array.isArray(completedTaskBeforeDelivery.postValidationIssues) ? completedTaskBeforeDelivery.postValidationIssues : []
+        };
+        const agentMeta = buildResponseMeta(intentContext, agentValidation, {
+          source: 'agent-task',
+          runtimeKind: completedTaskBeforeDelivery && completedTaskBeforeDelivery.runtimeKind ? completedTaskBeforeDelivery.runtimeKind : 'local'
+        });
+        this._setResponseMeta(activeChat.id, agentMeta);
+        this._logAuditDecision(activeChat.id, agentMeta);
         await appRuntime.tasks.deliverTaskToChat(preparedTask.id);
         const completedTask = appRuntime.store.loadTask(preparedTask.id);
         const assistantText = completedTask && completedTask.resultText ? completedTask.resultText : '';
         this._post({ type: 'done', text: assistantText });
       } else {
-        await this._runDirectChatFallback(activeChat, messages, '', { showThinking: false });
+        await this._runDirectChatFallback(activeChat, messages, '', { showThinking: false, intentContext });
         return;
       }
       await appRuntime.maybeCompactChat(activeChat.id);
@@ -5595,6 +5844,23 @@ function createTestingApi() {
     getFeatureSnapshot() {
       return appRuntime.features.getSnapshot();
     },
+    getResponseMeta(chatId) {
+      const activeChatId = chatId || appRuntime.store.getActiveChatId();
+      return chatProvider && typeof chatProvider._getResponseMeta === 'function'
+        ? chatProvider._getResponseMeta(activeChatId)
+        : null;
+    },
+    evaluateAntiHallucination(userText, assistantText = '', messages = [], contextMeta = null) {
+      const intentContext = injectIntentFormatInstructions(messages, userText, contextMeta);
+      const validation = assistantText
+        ? antiHallucination.validateAssistantResponse(assistantText, intentContext)
+        : { status: 'pending', issues: [] };
+      return {
+        intentContext,
+        validation,
+        responseMeta: buildResponseMeta(intentContext, validation)
+      };
+    },
     async spawnAgent(input) {
       await appRuntime.initialize();
       return appRuntime.features.executeTool('spawn_agent', input || {}, {
@@ -5619,7 +5885,8 @@ function createTestingApi() {
         assistantText: assistant ? assistant.content : '',
         messages,
         contextMeta: appRuntime.getContextMeta(activeChat.id),
-        ragStatus: appRuntime.rag.getStatus()
+        ragStatus: appRuntime.rag.getStatus(),
+        responseMeta: chatProvider && typeof chatProvider._getResponseMeta === 'function' ? chatProvider._getResponseMeta(activeChat.id) : null
       };
     }
   };
@@ -5629,6 +5896,7 @@ function createTestingApi() {
 async function activate(context) {
   extensionContext = context;
   appRuntime = new LocalAIRuntime(context);
+  void appRuntime.maybeAutoStartDocker({ reason: 'activate-entry', waitForReady: false });
 
   // Status bar
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);

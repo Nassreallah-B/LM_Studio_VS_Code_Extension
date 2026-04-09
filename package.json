@@ -32,7 +32,8 @@
   "scripts": {
     "cloud:executor": "node cloud-executor/server.js",
     "test:cloud-smoke": "node scripts/run-cloud-executor-smoke.js",
-    "test:vscode-live": "node scripts/run-vscode-live-tests.js"
+    "test:vscode-live": "node scripts/run-vscode-live-tests.js",
+    "test:anti-hallucination": "node scripts/run-anti-hallucination-checks.js"
   },
   "contributes": {
     "configuration": {
@@ -302,17 +303,23 @@
           "description": "Block agent execution when Docker or the sandbox image is unavailable instead of silently falling back to host execution.",
           "order": 38
         },
+        "localai.sandbox.autoStartDocker": {
+          "type": "boolean",
+          "default": true,
+          "description": "On Windows, try to launch Docker Desktop automatically when the extension opens or when tools first need the sandbox runtime.",
+          "order": 39
+        },
         "localai.sandbox.image": {
           "type": "string",
           "default": "localai-code-sandbox:latest",
           "description": "Docker image used for the local and remote workspace sandbox runtime.",
-          "order": 39
+          "order": 40
         },
         "localai.sandbox.autoBuildImage": {
           "type": "boolean",
           "default": true,
           "description": "Automatically build the sandbox image from sandbox/Dockerfile when it is missing.",
-          "order": 40
+          "order": 41
         },
         "localai.sandbox.networkMode": {
           "type": "string",
@@ -322,25 +329,25 @@
             "bridge"
           ],
           "description": "Network mode for sandbox containers. The default is fully offline.",
-          "order": 41
+          "order": 42
         },
         "localai.sandbox.maxConcurrentSandboxes": {
           "type": "number",
           "default": 2,
           "description": "Maximum number of sandboxed local agent tasks allowed to run at the same time.",
-          "order": 42
+          "order": 43
         },
         "localai.sandbox.toolTimeoutMs": {
           "type": "number",
           "default": 120000,
           "description": "Maximum runtime for a single sandbox tool call or shell command.",
-          "order": 43
+          "order": 44
         },
         "localai.sandbox.retainOnFailure": {
           "type": "boolean",
           "default": true,
           "description": "Keep sandbox workspaces and containers after failed tasks for postmortem review.",
-          "order": 44
+          "order": 45
         },
         "localai.web.searchProvider": {
           "type": "string",

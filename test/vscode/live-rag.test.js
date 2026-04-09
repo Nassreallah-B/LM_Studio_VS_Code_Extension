@@ -78,6 +78,16 @@ exports.run = async function run() {
   );
   console.log(`[localai-code:test] Assistant replied: ${result.assistantText}`);
 
+  const antiAudit = api.testing.evaluateAntiHallucination('fais un audit complet du projet', 'Affirmation: X\nVerdict: CONFIRMED\nEvidence: src/index.js\nCritical comment: ok', result.messages, result.contextMeta);
+  assert.strictEqual(antiAudit.intentContext.intent, 'audit', `Expected audit intent, got ${JSON.stringify(antiAudit.intentContext)}`);
+  assert.strictEqual(antiAudit.intentContext.strictAuditMode, true, `Expected strict audit mode, got ${JSON.stringify(antiAudit.intentContext)}`);
+  assert.strictEqual(antiAudit.validation.status, 'passed', `Expected audit validation to pass, got ${JSON.stringify(antiAudit.validation)}`);
+
+  const antiSecurity = api.testing.evaluateAntiHallucination('security review of auth and xss', 'Short summary only', result.messages, result.contextMeta);
+  assert.strictEqual(antiSecurity.intentContext.intent, 'security', `Expected security intent, got ${JSON.stringify(antiSecurity.intentContext)}`);
+  assert.notStrictEqual(antiSecurity.validation.status, 'passed', 'Expected incomplete security response to trigger validation warnings.');
+  console.log(`[localai-code:test] Anti-hallucination checks: audit=${antiAudit.validation.status} security=${antiSecurity.validation.status}`);
+
   const contextMeta = result.contextMeta || {};
   assert(contextMeta.ragSnippets > 0, `Expected retrieved snippets in context meta, got ${JSON.stringify(contextMeta)}`);
   assert.strictEqual(contextMeta.ragMode, 'hybrid', `Expected hybrid rag mode, got ${JSON.stringify(contextMeta)}`);
