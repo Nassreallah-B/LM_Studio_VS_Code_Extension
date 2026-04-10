@@ -2127,6 +2127,7 @@ window.addEventListener('message', e => {
   switch (msg.type) {
 
     case 'state': {
+      console.log(`[Webview] Received state. Active ID: ${msg.activeChatId}, Messages: ${msg.messages ? msg.messages.length : 0}`);
       loadedState = msg;
       if (msg.busy) {
         if (!currentMsgEl) appendThinking();

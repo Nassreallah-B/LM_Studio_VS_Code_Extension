@@ -492,6 +492,33 @@ function cloneMessages(messages) {
     : [];
 }
 
+/**
+ * Normalizes messages for standard OpenAI-compatible APIs.
+ * Maps internal roles like 'system-msg' to 'system' and filters out unsupported roles.
+ */
+function toApiMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .filter(msg => msg && typeof msg === 'object')
+    .map(msg => {
+      let role = msg.role;
+      // Map internal UI roles to standard API roles
+      if (role === 'system-msg') role = 'system';
+      if (role === 'thought') role = 'assistant';
+      
+      // Strict filtering: only allow system, user, assistant
+      if (!['system', 'user', 'assistant'].includes(role)) {
+        return null; 
+      }
+      
+      return {
+        role,
+        content: String(msg.content || '')
+      };
+    })
+    .filter(Boolean);
+}
+
 function cloneLogs(logs) {
   return Array.isArray(logs)
     ? logs.map(log => ({ ...log }))
@@ -2757,6 +2784,7 @@ class PersistentState {
       lastCompactedMessageCount: 0,
       updatedAt: now
     });
+    console.log(`[Store] Created chat: ${chat.id} (${chat.title})`);
     this.chatIndex.activeChatId = chat.id;
     this.saveChatIndex();
     return chat;
@@ -2788,9 +2816,14 @@ class PersistentState {
   }
 
   selectChat(chatId) {
-    if (!this.chatIndex.chats.some(chat => chat.id === chatId)) return null;
+    console.log(`[Store] selectChat requested: ${chatId}`);
+    if (!this.chatIndex.chats.some(chat => chat.id === chatId)) {
+      console.warn(`[Store] selectChat failed: ${chatId} not found in chats`);
+      return null;
+    }
     this.chatIndex.activeChatId = chatId;
     this.saveChatIndex();
+    console.log(`[Store] activeChatId updated to: ${this.chatIndex.activeChatId}`);
     return this.getActiveChat();
   }
 
@@ -5285,10 +5318,14 @@ async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
   const modelId = await resolveChatModelId(body.model || getModelId());
   const url = new URL(`${getBaseUrl()}${endpoint || '/chat/completions'}`);
   const transport = url.protocol === 'http:' ? http : https;
-  const requestBody = {
-    ...body,
-    model: modelId
-  };
+  
+  // Ensure the model is included in the body
+  body.model = modelId;
+  // Sanitize messages for API
+  if (body.messages) {
+    body.messages = toApiMessages(body.messages);
+  }
+  const payload = JSON.stringify(body);
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -5683,6 +5720,7 @@ class LocalAIChatViewProvider {
         case 'selectFork': {
           const targetChatId = msg.chatId || '';
           if (targetChatId) {
+            console.log(`[Extension] Received selectFork: ${targetChatId}`);
             appRuntime.store.selectChat(targetChatId);
             await this.syncState();
           }
