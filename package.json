@@ -443,6 +443,21 @@
         "title": "LocalAI: Review Pending Patch",
         "icon": "$(diff)",
         "enablement": "localai.viewingDiff"
+      },
+      {
+        "command": "localai.cleanSandboxes",
+        "title": "LocalAI: Clean Sandbox Workspaces",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "localai.createAgentsMd",
+        "title": "LocalAI: Create AGENTS.md",
+        "icon": "$(file-add)"
+      },
+      {
+        "command": "localai.viewMemory",
+        "title": "LocalAI: View Memory Notes",
+        "icon": "$(book)"
       }
     ],
     "keybindings": [

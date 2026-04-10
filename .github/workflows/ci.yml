@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  checks:
+    name: Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Anti-hallucination checks
+        run: node scripts/run-anti-hallucination-checks.js
+
+      - name: Cloud executor smoke test
+        run: node scripts/run-cloud-executor-smoke.js
+        env:
+          LOCALAI_BASE_URL: 'http://localhost:1234/v1'
+          CLOUD_EXECUTOR_SKIP_DOCKER: 'true'
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --ignore-scripts
+      - name: Check for console.log in production code
+        run: |
+          if grep -rn "console\.log" extension.js lib/ --include="*.js" | grep -v "//.*console\.log" | grep -v "^\s*//" ; then
+            echo "WARNING: console.log found in production files"
+          fi

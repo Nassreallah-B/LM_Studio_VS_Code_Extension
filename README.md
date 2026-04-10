@@ -1,157 +1,207 @@
-# LocalAI Code
+# LocalAI Code — LM Studio
 
-LocalAI Code est une extension VS Code orientee agent de code, branchée sur LM Studio. Elle combine chat persistant, mémoire durable, RAG workspace, tâches agent, sandbox Docker, patch review et exécution cloud optionnelle.
+> Extension VS Code d'assistance au codage alimentée par LM Studio (modèles locaux).
+> Architecture agentic distribuée : agents autonomes, sandbox Docker, mémoire persistante, RAG hybride et exécuteur cloud — 100% hors ligne.
 
-## Ce que fait l'extension
+---
 
-- ouvre un chat persistant par workspace, avec historique sauvegardé sur disque
-- construit le contexte à partir des instructions, de la mémoire, du résumé, du fichier actif et du retrieval
-- peut répondre en chat direct ou en mode agent multi-étapes
-- exécute les outils agent dans un sandbox Docker au lieu du workspace hôte
-- produit un patch à relire avant toute écriture réelle dans le projet
-- peut déléguer des tâches longues au cloud executor
+## ✨ Fonctionnalités Clés
 
-## Architecture rapide
+### 🤖 Agent Autonome Multi-Rounds — 100% Local
+- **Modèle 100% local** via LM Studio (API OpenAI-compatible)
+- **Aucune donnée envoyée dans le cloud** (sauf si cloud executor activé)
+- **Agent foreground** : traite les messages avec outils (fichiers, shell, git, web optionnel)
+- **Agent background** : tâche persistante avec checkpoints
+- **Sub-agents et équipes** : orchestration complète locale
 
-- `extension.js` : point d’entrée principal, orchestration, stockage, chat, agent runtime, RAG, UI bridge
-- `media/` : webview du chat
-- `lib/` : sandbox Docker et helpers runtime partagés
-- `cloud-executor/` : serveur optionnel pour les tâches distantes
-- `sandbox/` : image Docker utilisée par les outils agent
-- `docs/` : documentation d’architecture, protocoles, tests et usage
-- `scripts/` : smoke tests et live tests
-- `test/` : scénarios de test côté extension host
+### 🐳 Sandbox Docker Isolé
+- Exécution isolée dans un container Node.js 22
+- Mode réseau configurable : `none` (offline total) ou `bridge` (accès LM Studio)
+- Image auto-buildée depuis `sandbox/Dockerfile`
+- Le workspace hôte n'est JAMAIS modifié directement
 
-## Installation
+### 🧠 Mémoire & RAG Local
+- Mémoire conversationnelle persistante (global + workspace)
+- RAG hybride : lexical + sémantique (embeddings locaux)
+- Auto-indexation configurable du workspace
 
-### Installation utilisateur
+### ☁️ Cloud Executor (optionnel)
+- Serveur distant sur port 7789 par défaut
+- LM Studio sur `host.docker.internal:1234`
+- Déployable en Docker
 
-1. Installer l’extension dans VS Code.
-2. Lancer LM Studio.
-3. Activer le serveur local OpenAI-compatible.
-4. Vérifier `localai.baseUrl` et `localai.nativeBaseUrl`.
-5. Choisir un `localai.modelId` ou laisser `auto`.
-6. Charger au moins un modèle chat dans LM Studio.
+---
 
-### Installation développeur
+## 🚀 Configuration
 
-1. Cloner le repo.
-2. Ouvrir le dossier dans VS Code.
-3. Installer les dépendances si nécessaire.
-4. Lancer LM Studio localement.
-5. Démarrer l’extension en mode développement via l’host VS Code.
-6. Vérifier Docker si le mode agent avec outils doit être utilisé.
+### Prérequis
+- VS Code 1.94+
+- LM Studio (https://lmstudio.ai) — démarrer le serveur local sur le port 1234
+- Docker Desktop (pour le sandbox)
 
-## Prérequis
+### Configuration Rapide
 
-### Obligatoires
+```jsonc
+// .vscode/settings.json
+{
+  "localai.baseUrl": "http://localhost:1234/v1",
+  "localai.modelId": "auto",
+  "localai.temperature": 0.1,
+  "localai.maxTokens": 8192,
 
-- VS Code `^1.94.0`
-- LM Studio en cours d’exécution
-- serveur local activé
-- au moins un modèle chat chargé
+  // Mémoire
+  "localai.memory.enabled": true,
+  "localai.memory.scope": "global+workspace",
+  "localai.memory.maxRecentMessages": 15,
 
-### Pour le retrieval sémantique
+  // RAG
+  "localai.rag.enabled": true,
+  "localai.rag.mode": "hybrid-local",
+  "localai.rag.topK": 8,
+  "localai.rag.autoRefreshIntervalMinutes": 20,
 
-- un modèle d’embedding chargé dans LM Studio, ou `localai.rag.embeddingModel` configuré explicitement
+  // Agent
+  "localai.agent.enabled": true,
+  "localai.agent.maxRounds": 15,
+  "localai.agent.allowShell": true,
+  "localai.agent.shellTimeoutMs": 60000,
+  "localai.agent.maxConcurrentTasks": 2,
 
-### Pour le mode agent avec outils
+  // Sandbox Docker
+  "localai.sandbox.enabled": true,
+  "localai.sandbox.autoStartDocker": true,
+  "localai.sandbox.image": "localai-code-sandbox:latest",
+  "localai.sandbox.autoBuildImage": true,
+  // "none" = offline; "bridge" = accès LM Studio depuis le sandbox
+  "localai.sandbox.networkMode": "none",
+  "localai.sandbox.toolTimeoutMs": 120000,
+  "localai.sandbox.retainOnFailure": true
+}
+```
 
-- Docker Desktop avec moteur Linux actif
-- WSL2 sur Windows
-- image construite depuis `sandbox/Dockerfile`
+---
 
-### Pour le cloud executor
+## 🛠️ Commandes Disponibles
 
-- un serveur Node capable de lancer `cloud-executor/server.js`
-- un LM Studio accessible depuis la machine du serveur
+| Commande | Description |
+|---|---|
+| `LocalAI: Open Chat` | Ouvrir le panneau de chat |
+| `LocalAI: New Conversation` | Démarrer une nouvelle conversation |
+| `LocalAI: Select / Change Model` | Changer le modèle LM Studio |
+| `LocalAI: Check Connection` | Vérifier la connexion LM Studio |
+| `LocalAI: Explain Code` | Expliquer le code sélectionné |
+| `LocalAI: Fix Code` | Corriger le code sélectionné |
+| `LocalAI: Refactor Code` | Refactoriser le code sélectionné |
+| `LocalAI: Generate Tests` | Générer des tests unitaires |
+| `LocalAI: Optimize Code` | Optimiser le code sélectionné |
+| `LocalAI: Add Comments` | Ajouter des commentaires |
+| `LocalAI: Accept Pending Patch` | Appliquer le patch en attente |
+| `LocalAI: Reject Pending Patch` | Rejeter le patch en attente |
+| `LocalAI: Review Pending Patch` | Ouvrir la revue du patch |
+| `LocalAI: Clean Sandbox Workspaces` | Nettoyer les workspaces sandbox |
+| `LocalAI: Create AGENTS.md` | Créer un fichier d'instructions agents |
+| `LocalAI: View Memory Notes` | Voir les notes mémorisées |
 
-## Réglages importants
+---
 
-### Cœur
+## 🏗️ Architecture
 
-- `localai.baseUrl`
-- `localai.nativeBaseUrl`
-- `localai.modelId`
-- `localai.temperature`
-- `localai.maxTokens`
-- `localai.sendFileContext`
+```
+extension.js                  ← Noyau principal (6500+ lignes)
+lib/
+  dockerSandbox.js            ← Gestionnaire Docker
+  runtimeFeatures.js          ← Sub-agents, teams, hooks, MCP-like
+  antiHallucination.js        ← Validation post-génération
+cloud-executor/
+  server.js                   ← Serveur HTTP d'exécution distante
+  Dockerfile                  ← Image cloud executor
+  docker-compose.yml          ← Déploiement (port 7789)
+  .env.example                ← Variables d'environnement
+sandbox/
+  Dockerfile                  ← Image sandbox Node.js 22 + outils
+scripts/
+  build-sandbox.js            ← Build image sandbox
+test/
+  antiHallucination.test.js   ← Tests unitaires
+docs/
+  ADVANCED_AGENT_RUNTIME.md
+  AGENTS_AND_SANDBOXES.md
+  ARCHITECTURE_MEMORY_RAG.md
+  CLOUD_EXECUTOR.md
+```
 
-### Mémoire et retrieval
+---
 
-- `localai.memory.enabled`
-- `localai.memory.scope`
-- `localai.rag.enabled`
-- `localai.rag.mode`
-- `localai.rag.embeddingModel`
-- `localai.rag.embeddingMaxRetries`
-- `localai.rag.autoRefreshIntervalMinutes`
+## 🐳 Build Sandbox
 
-### Agent et sandbox
+```powershell
+# Build de l'image sandbox
+node scripts/build-sandbox.js
 
-- `localai.agent.enabled`
-- `localai.agent.maxRounds`
-- `localai.agent.allowShell`
-- `localai.sandbox.enabled`
-- `localai.sandbox.runtimeRequired`
-- `localai.sandbox.image`
-- `localai.sandbox.toolTimeoutMs`
-- `localai.sandbox.containerModelBaseUrl`
-- `localai.sandbox.containerNativeBaseUrl`
+# Rebuild forcé
+node scripts/build-sandbox.js --force
+```
 
-### Cloud
+> **Note :** Si `localai.sandbox.networkMode = "bridge"`, le sandbox peut atteindre LM Studio via `http://host.docker.internal:1234/v1`.
 
-- `localai.cloud.enabled`
-- `localai.cloud.executorUrl`
-- `localai.cloud.apiKey`
-- `localai.cloud.pollIntervalMs`
+---
 
-## Fonctionnement
+## ☁️ Déploiement Cloud Executor
 
-### Chat
+```powershell
+# 1. Copier .env.example
+cp cloud-executor/.env.example cloud-executor/.env
 
-Le message utilisateur arrive dans `extension.js`, le contexte est reconstruit, puis la requête part soit en chat direct, soit dans la boucle agent. L’état du chat est persisté sur disque.
+# 2. Renseigner CLOUD_EXECUTOR_API_KEY
+notepad cloud-executor/.env
 
-### RAG
+# 3. Lancer avec Docker Compose
+cd cloud-executor
+docker compose up -d
 
-Le workspace est découpé en chunks. Le retrieval lexical et sémantique injecte les snippets les plus utiles dans le prompt final. Les embeddings sont demandés à LM Studio.
+# 4. Configurer dans VS Code
+# localai.cloud.enabled = true
+# localai.cloud.executorUrl = http://127.0.0.1:7789
+# localai.cloud.apiKey = <votre clé>
+```
 
-### Agent
+---
 
-L’agent peut demander des outils comme lecture fichier, recherche texte, shell, web ou LSP. Les outils sont exécutés dans le sandbox Docker. Les modifications sont transformées en patch review au lieu d’être appliquées directement au workspace.
+## 🔧 Résolution des Problèmes Courants
 
-### Patch review
+### LM Studio non accessible depuis le sandbox
+```json
+"localai.sandbox.networkMode": "bridge"
+```
+Le sandbox accède alors à `http://host.docker.internal:1234/v1`.
 
-Quand l’agent modifie des fichiers, l’extension crée un patch en attente. L’utilisateur peut le relire, l’accepter ou le rejeter.
+### Agent figé à 0% CPU
+- Vérifier que LM Studio est démarré et le modèle est chargé
+- Recharger VS Code (`Developer: Reload Window`)
+- Vérifier les logs dans l'Output Channel `LocalAI: Debug`
 
-### Cloud executor
+### Erreur `Unexpected message role`
+- Certains modèles LM Studio n'acceptent pas le rôle `system` en milieu de conversation
+- Le comportement correct est implémenté : les tool results utilisent le rôle `user`
 
-Les tâches longues peuvent être envoyées à `cloud-executor/server.js`. Le serveur recrée le snapshot du workspace, lance le sandbox, exécute les rounds agent et interroge LM Studio via les URLs configurées.
+---
 
-## Commandes utiles
+## 🔒 Confidentialité
 
-- `localai.openChat`
-- `localai.newChat`
-- `localai.selectModel`
-- `localai.checkConnection`
-- `localai.reviewDiff`
-- `localai.acceptDiff`
-- `localai.rejectDiff`
+- **100% local** : aucune donnée n'est envoyée à Hugging Face ou à un serveur externe
+- **Sandbox réseau** : mode `none` par défaut — le container est complètement offline
+- **Secrets** : aucun secret n'est injecté dans le container
 
-## Tests
+---
 
-- `npm run test:cloud-smoke`
-- `npm run test:vscode-live`
-- `npm run cloud:executor`
+## 🗺️ Roadmap
 
-## Documentation par dossier
+- [ ] Mode réseau `host-model` pour accès LM Studio filtré depuis sandbox
+- [ ] Tests CI GitHub Actions automatisés
+- [ ] MCP tool invocation distante
+- [ ] Dashboard agents tree dans le webview
+- [ ] Visualisation des coûts (tokens estimés)
 
-- [cloud-executor/README.md](/c:/Serveurs/localai-code-1.0.0/cloud-executor/README.md)
-- [docs/README.md](/c:/Serveurs/localai-code-1.0.0/docs/README.md)
-- [lib/README.md](/c:/Serveurs/localai-code-1.0.0/lib/README.md)
-- [media/README.md](/c:/Serveurs/localai-code-1.0.0/media/README.md)
-- [resources/README.md](/c:/Serveurs/localai-code-1.0.0/resources/README.md)
-- [sandbox/README.md](/c:/Serveurs/localai-code-1.0.0/sandbox/README.md)
-- [scripts/README.md](/c:/Serveurs/localai-code-1.0.0/scripts/README.md)
-- [test/README.md](/c:/Serveurs/localai-code-1.0.0/test/README.md)
-- [test/vscode/README.md](/c:/Serveurs/localai-code-1.0.0/test/vscode/README.md)
+---
+
+*LocalAI Code v1.2.0 — MIT License*

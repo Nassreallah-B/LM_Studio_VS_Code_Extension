@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  localai-executor:
+    build:
+      context: ..
+      dockerfile: cloud-executor/Dockerfile
+    image: localai-code-executor:latest
+    container_name: localai-executor
+    ports:
+      - "${PORT:-7789}:7789"
+    extra_hosts:
+      # Permet au container d'atteindre LM Studio sur l'hôte Windows/Mac
+      - "host.docker.internal:host-gateway"
+    environment:
+      - LOCALAI_BASE_URL=${LOCALAI_BASE_URL:-http://host.docker.internal:1234/v1}
+      - LOCALAI_NATIVE_BASE_URL=${LOCALAI_NATIVE_BASE_URL:-http://host.docker.internal:1234}
+      - LOCALAI_MODEL_ID=${LOCALAI_MODEL_ID:-auto}
+      - CLOUD_EXECUTOR_DATA_DIR=/data
+      - CLOUD_EXECUTOR_API_KEY=${CLOUD_EXECUTOR_API_KEY}
+      - CLOUD_EXECUTOR_MAX_CONCURRENT_TASKS=${CLOUD_EXECUTOR_MAX_CONCURRENT_TASKS:-2}
+      - CLOUD_EXECUTOR_MAX_ROUNDS=${CLOUD_EXECUTOR_MAX_ROUNDS:-15}
+      - CLOUD_EXECUTOR_SHELL_TIMEOUT_MS=${CLOUD_EXECUTOR_SHELL_TIMEOUT_MS:-60000}
+      - CLOUD_EXECUTOR_SANDBOX_IMAGE=localai-code-sandbox:latest
+      # bridge pour que le sandbox puisse atteindre LM Studio
+      - CLOUD_EXECUTOR_SANDBOX_NETWORK=bridge
+      - CLOUD_EXECUTOR_SANDBOX_TOOL_TIMEOUT_MS=${CLOUD_EXECUTOR_SANDBOX_TOOL_TIMEOUT_MS:-120000}
+      - PORT=7789
+    volumes:
+      - executor-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  executor-data:
+    driver: local

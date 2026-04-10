@@ -5370,8 +5370,11 @@ async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
           .map(line => line.slice(5).trimStart())
           .join('\n')
           .trim();
-
-        if (!dataPayload || dataPayload === '[DONE]') return;
+        if (!dataPayload) return;
+        if (dataPayload === '[DONE]') {
+          if (typeof finishResolve === 'function') finishResolve(fullText);
+          return;
+        }
 
         try {
           const json = JSON.parse(dataPayload);
@@ -6417,6 +6420,51 @@ async function activate(context) {
         return;
       }
       await appRuntime.reviewPatch(patch.id);
+    }),
+    vscode.commands.registerCommand('localai.cleanSandboxes', async () => {
+      try {
+        await appRuntime.initialize();
+        const sandboxesDir = path.join(appRuntime.store.storageRoot, SANDBOXES_DIR);
+        if (!fs.existsSync(sandboxesDir)) { vscode.window.showInformationMessage('No sandbox directory found.'); return; }
+        const entries = fs.readdirSync(sandboxesDir);
+        let removed = 0;
+        for (const entry of entries) {
+          try { fs.rmSync(path.join(sandboxesDir, entry), { recursive: true, force: true }); removed++; } catch (_) {}
+        }
+        vscode.window.showInformationMessage(`Cleaned ${removed} sandbox workspace(s).`);
+        if (chatProvider) await chatProvider.syncState();
+      } catch (err) { vscode.window.showErrorMessage(`Failed to clean sandboxes: ${err.message}`); }
+    }),
+    vscode.commands.registerCommand('localai.createAgentsMd', async () => {
+      const folders = vscode.workspace.workspaceFolders;
+      if (!folders || folders.length === 0) { vscode.window.showWarningMessage('No workspace folder open.'); return; }
+      const rootPath = folders[0].uri.fsPath;
+      const agentsMdPath = path.join(rootPath, 'AGENTS.md');
+      if (fs.existsSync(agentsMdPath)) {
+        const choice = await vscode.window.showQuickPick(['Yes, overwrite', 'No, open existing'], { placeHolder: 'AGENTS.md already exists.' });
+        if (!choice || choice.startsWith('No')) { vscode.window.showTextDocument(vscode.Uri.file(agentsMdPath)); return; }
+      }
+      let pkgInfo = {};
+      try { pkgInfo = JSON.parse(fs.readFileSync(path.join(rootPath, 'package.json'), 'utf8')); } catch (_) {}
+      const projectName = pkgInfo.name || path.basename(rootPath);
+      const deps = pkgInfo.dependencies ? Object.keys(pkgInfo.dependencies).slice(0, 8).map(d => `- ${d}`).join('\n') : '- (a renseigner)';
+      const scripts = pkgInfo.scripts ? Object.entries(pkgInfo.scripts).slice(0, 5).map(([k,v]) => `- ${k}: \`${v}\``).join('\n') : '- test: npm test';
+      const template = `# Instructions Agents IA\n\n> ${pkgInfo.description || 'Configuration agents LocalAI Code'}\n\n## Stack\n${deps}\n\n## Conventions\n- Tests obligatoires pour fonctions critiques\n\n## Commandes\n${scripts}\n\n## Notes\n- (Ajoutez ici toute information importante)\n`;
+      fs.writeFileSync(agentsMdPath, template, 'utf8');
+      const doc = await vscode.workspace.openTextDocument(agentsMdPath);
+      await vscode.window.showTextDocument(doc);
+      vscode.window.showInformationMessage('AGENTS.md cree. Personnalisez-le pour vos agents.');
+    }),
+    vscode.commands.registerCommand('localai.viewMemory', async () => {
+      try {
+        await appRuntime.initialize();
+        const gNotes = appRuntime.store.getAllMemoryNotes ? appRuntime.store.getAllMemoryNotes('global') : [];
+        const wNotes = appRuntime.store.getAllMemoryNotes ? appRuntime.store.getAllMemoryNotes('workspace') : [];
+        const all = [...gNotes.map(n => `[Global][${n.kind||'note'}] ${n.content}`), ...wNotes.map(n => `[Workspace][${n.kind||'note'}] ${n.content}`)];
+        const content = all.length ? all.join('\n\n') : '(No memory notes yet.)';
+        const doc = await vscode.workspace.openTextDocument({ content: `# LocalAI Code Memory Notes\n\n${content}`, language: 'markdown' });
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch (err) { vscode.window.showErrorMessage(`Failed to load memory: ${err.message}`); }
     })
   );
 
