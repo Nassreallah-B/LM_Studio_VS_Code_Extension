@@ -3293,6 +3293,7 @@ class LocalAIRuntime {
       dockerfilePath: path.join(context.extensionUri.fsPath, 'sandbox', 'Dockerfile'),
       networkMode: getSandboxNetworkMode(),
       autoBuild: sandboxAutoBuildImage(),
+      autoStartDocker: sandboxAutoStartDocker(),
       keepSandboxes: sandboxRetainOnFailure(),
       maxToolTimeoutMs: getSandboxToolTimeoutMs(),
       containerNamePrefix: 'localai-sbx'
