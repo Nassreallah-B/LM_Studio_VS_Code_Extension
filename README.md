@@ -8,24 +8,29 @@
 ## ✨ Fonctionnalités Clés
 
 ### 🤖 Agent Autonome Multi-Rounds — 100% Local
+
 - **Modèle 100% local** via LM Studio (API OpenAI-compatible)
 - **Aucune donnée envoyée dans le cloud** (sauf si cloud executor activé)
 - **Agent foreground** : traite les messages avec outils (fichiers, shell, git, web optionnel)
 - **Agent background** : tâche persistante avec checkpoints
+- **ARIA Agent Ecosystem** : 10+ rôles spécialisés (ARIA Orchestrator, RTL UI Auditor, Database Expert, Security Sentinel) avec budgets d'étapes dynamiques (jusqu'à 80 rounds)
 - **Sub-agents et équipes** : orchestration complète locale
 
 ### 🐳 Sandbox Docker Isolé
+
 - Exécution isolée dans un container Node.js 22
 - Mode réseau configurable : `none` (offline total) ou `bridge` (accès LM Studio)
 - Image auto-buildée depuis `sandbox/Dockerfile`
 - Le workspace hôte n'est JAMAIS modifié directement
 
 ### 🧠 Mémoire & RAG Local
+
 - Mémoire conversationnelle persistante (global + workspace)
 - RAG hybride : lexical + sémantique (embeddings locaux)
 - Auto-indexation configurable du workspace
 
 ### ☁️ Cloud Executor (optionnel)
+
 - Serveur distant sur port 7789 par défaut
 - LM Studio sur `host.docker.internal:1234`
 - Déployable en Docker
@@ -35,8 +40,9 @@
 ## 🚀 Configuration
 
 ### Prérequis
+
 - VS Code 1.94+
-- LM Studio (https://lmstudio.ai) — démarrer le serveur local sur le port 1234
+- LM Studio (<https://lmstudio.ai>) — démarrer le serveur local sur le port 1234
 - Docker Desktop (pour le sandbox)
 
 ### Configuration Rapide
@@ -84,7 +90,7 @@
 ## 🛠️ Commandes Disponibles
 
 | Commande | Description |
-|---|---|
+| --- | --- |
 | `LocalAI: Open Chat` | Ouvrir le panneau de chat |
 | `LocalAI: New Conversation` | Démarrer une nouvelle conversation |
 | `LocalAI: Select / Change Model` | Changer le modèle LM Studio |
@@ -106,7 +112,7 @@
 
 ## 🏗️ Architecture
 
-```
+```text
 extension.js                  ← Noyau principal (6500+ lignes)
 lib/
   dockerSandbox.js            ← Gestionnaire Docker
@@ -170,17 +176,21 @@ docker compose up -d
 ## 🔧 Résolution des Problèmes Courants
 
 ### LM Studio non accessible depuis le sandbox
+
 ```json
 "localai.sandbox.networkMode": "bridge"
 ```
+
 Le sandbox accède alors à `http://host.docker.internal:1234/v1`.
 
 ### Agent figé à 0% CPU
+
 - Vérifier que LM Studio est démarré et le modèle est chargé
 - Recharger VS Code (`Developer: Reload Window`)
 - Vérifier les logs dans l'Output Channel `LocalAI: Debug`
 
 ### Erreur `Unexpected message role`
+
 - Certains modèles LM Studio n'acceptent pas le rôle `system` en milieu de conversation
 - Le comportement correct est implémenté : les tool results utilisent le rôle `user`
 
@@ -204,4 +214,6 @@ Le sandbox accède alors à `http://host.docker.internal:1234/v1`.
 
 ---
 
-*LocalAI Code v1.2.0 — MIT License*
+## License
+
+LocalAI Code v1.2.0 — MIT License

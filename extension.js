@@ -285,8 +285,20 @@ function agentEnabled() {
   return cfg('agent.enabled') !== false;
 }
 
-function getAgentMaxRounds() {
-  return Math.max(1, Math.min(12, Number(cfg('agent.maxRounds') || DEFAULT_AGENT_MAX_ROUNDS)));
+function getAgentMaxRounds(agentType) {
+  const custom = cfg('agent.maxRounds');
+  if (custom) return Math.max(1, Math.min(100, Number(custom)));
+  
+  switch(agentType || '') {
+    case 'refactoring-expert': return 80;
+    case 'aria-orchestrator': return 50;
+    case 'database-expert': return 35;
+    case 'rtl-ui-auditor': return 30;
+    case 'security-sentinel': return 30;
+    case 'performance-monitor': return 30;
+    case 'onboarding-expert': return 20;
+    default: return DEFAULT_AGENT_MAX_ROUNDS;
+  }
 }
 
 function agentAllowShell() {
@@ -4101,7 +4113,7 @@ class CloudExecutorClient {
       modelId: normalizeModelId(getModelId()),
       temperature: cfg('temperature') ?? 0.2,
       maxTokens: cfg('maxTokens') ?? 4096,
-      maxRounds: getAgentMaxRounds(),
+      maxRounds: getAgentMaxRounds(input.agentType),
       allowShell: agentAllowShell(),
       shellTimeoutMs: getAgentShellTimeoutMs(),
       agentId: localTask.agentId || '',
@@ -4294,7 +4306,7 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
   let task = runtime.store.loadTask(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
   execContext.chatId = task.chatId || '';
-  const maxRounds = Math.max(1, Math.min(12, Number(task.maxRounds || getAgentMaxRounds())));
+  const maxRounds = Math.max(1, Math.min(100, Number(task.maxRounds || getAgentMaxRounds(task.agentType))));
   const executedTools = [];
   const priorToolResults = new Map();
 
@@ -4741,7 +4753,7 @@ class AgentTaskManager {
       executorUrl: runtimeKind === 'cloud' ? getCloudExecutorUrl() : '',
       executionRoot,
       messages: preparedMessages,
-      maxRounds: getAgentMaxRounds(),
+      maxRounds: getAgentMaxRounds(task.agentType),
       containerImage: runtimeKind === 'local' ? getSandboxImage() : '',
       liveMode: Boolean(input.liveMode)
     });

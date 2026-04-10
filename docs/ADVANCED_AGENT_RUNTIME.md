@@ -21,6 +21,13 @@ The implementation is local-first. Durable runtime state is stored as versioned 
 
 ## Built-In Agent Types
 
+- `aria-orchestrator`: lead architect and event router (Step budget: 50)
+- `rtl-ui-auditor`: specialist for Arabic/RTL, Tailwind, and Premium UX (Step budget: 30)
+- `database-expert`: specialist for PostgreSQL, Supabase, and RLS (Step budget: 35)
+- `security-sentinel`: permanent security guardian with verdict behavior (Step budget: 30)
+- `refactoring-expert`: specialist for technical debt and Clean Code (Step budget: 80)
+- `performance-monitor`: guardian of Core Web Vitals and error tracking (Step budget: 30)
+- `onboarding-expert`: guardian of project conventions and standards
 - `general-purpose`: default execution agent
 - `Explore`: read-only code explorer
 - `Plan`: read-only planning agent
