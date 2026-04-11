@@ -1178,8 +1178,9 @@ function summarizeAssistantNoteForUi(note) {
   const flat = normalizeWhitespace(sanitized);
   if (/^(?:i(?:'m| am)? going to|i will|let me|je vais(?: maintenant)?|maintenant je vais|je vais continuer|commençons par|on va commencer par)\b/i.test(flat)) {
     return '';
-  }
-  return truncateText(sanitized, 220);
+  const cleaned = sanitized.replace(/\[PHASE:[^\]]*\]/gi, '').replace(/\[AUDIT:[^\]]*\]/gi, '').trim();
+  if (!cleaned) return '';
+  return truncateText(cleaned, 220);
 }
 
 function formatJsonForModel(value, maxChars = MAX_AGENT_TOOL_MODEL_RESULT_CHARS) {
@@ -6121,8 +6122,8 @@ class LocalAIChatViewProvider {
             this._post({
               type: 'systemMsg',
               text: round === 1
-                ? 'Waiting for the model to plan the first action. Docker will stay idle until the first tool call.'
-                : `Waiting for the model to continue round ${round}/${maxRounds}.`
+                ? '🧠 Building plan... Docker will start automatically when an action is needed.'
+                : `🔄 Refined plan for round ${round}/${maxRounds}...`
             });
           },
           onAssistantNote: (note) => {
@@ -6180,6 +6181,7 @@ class LocalAIChatViewProvider {
         this._activeForegroundTaskId = '';
         this._abortActiveStream = null;
         this._streaming = false;
+        await this.syncState();
       }
     }
   }
