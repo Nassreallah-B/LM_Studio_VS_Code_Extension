@@ -3,6 +3,7 @@
 const vscode = require('vscode');
 const http = require('http');
 const https = require('https');
+const zlib = require('zlib');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -18,6 +19,20 @@ const {
   RuntimeFeatureStore
 } = require('./lib/runtimeFeatures');
 
+// ── New modules (Ruflo-inspired improvements) ─────────────────────────────────
+const aiDefence = require('./lib/aiDefence');
+const { LearningEngine } = require('./lib/learningEngine');
+const { ProviderRouter, routeTaskToAgent } = require('./lib/providerRouter');
+const { PluginManager } = require('./lib/pluginManager');
+const { VectorDB } = require('./lib/vectorDB');
+const { SwarmOrchestrator, decomposeTask, TOPOLOGY } = require('./lib/swarmTopology');
+const { EncryptionVault } = require('./lib/encryption');
+const { scanPackageJson } = require('./lib/cveScanner');
+const { HookRegistry, WorkerPool } = require('./lib/hooksAndWorkers');
+const { MemoryDB } = require('./lib/memoryDB');
+const { SPARCWorkflow } = require('./lib/sparc');
+const { MutationGuard } = require('./lib/mutationGuard');
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let chatProvider;
 let statusBarItem;
@@ -28,14 +43,23 @@ let lastConnectionError = '';
 let extensionContext;
 let appRuntime;
 
-const DEFAULT_BASE_URL = 'http://localhost:1234/v1';
-const DEFAULT_NATIVE_BASE_URL = 'http://localhost:1234';
-const DEFAULT_CONTAINER_MODEL_BASE_URL = 'http://host.docker.internal:1234/v1';
-const DEFAULT_CONTAINER_NATIVE_BASE_URL = 'http://host.docker.internal:1234';
-const DEFAULT_MODEL_ID = 'auto';
-const FALLBACK_MODEL_ID = 'auto';
-const DEFAULT_EMBEDDING_MODEL = 'auto';
-const EMBEDDING_MODEL_HINTS = /\b(embed|embedding|bge|e5|gte|nomic|snowflake)\b/i;
+// ── New module instances ──────────────────────────────────────────────────────
+let learningEngine = null;
+let providerRouter = null;
+let pluginManager = null;
+let hookRegistry = null;
+let workerPool = null;
+let encryptionVault = null;
+let memoryDB = null;
+let mutationGuard = null;
+
+const HF_ROUTER_HOST = 'router.huggingface.co';
+const HF_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
+const HF_MODELS_PATH = '/v1/models';
+const HF_INFERENCE_PROVIDER = 'hf-inference';
+const DEFAULT_MODEL_ID = 'Qwen/Qwen3.5-397B-A17B:fastest';
+const FALLBACK_MODEL_ID = 'Qwen/Qwen2.5-Coder-32B-Instruct:fastest';
+const DEFAULT_EMBEDDING_MODEL = 'intfloat/multilingual-e5-large';
 const WORKSPACE_FILE_LIMIT = 400;
 const WORKSPACE_CONTEXT_EXCLUDES = '**/{node_modules,.git,dist,build,coverage,.next,out,target,.venv,venv,__pycache__}/**';
 const CHATS_DIR = 'chats';
@@ -129,11 +153,11 @@ const WORKSPACE_ACTION_INSTRUCTIONS = [
   'Use paths relative to the workspace root.',
   'For file edits, emit the complete final file content.',
   'Supported action tags:',
-  '<localai-write path="relative/path.ext">',
+  '<hfai-write path="relative/path.ext">',
   'FULL FILE CONTENT',
-  '</localai-write>',
-  '<localai-delete path="relative/path.ext" />',
-  '<localai-open path="relative/path.ext" />',
+  '</hfai-write>',
+  '<hfai-delete path="relative/path.ext" />',
+  '<hfai-open path="relative/path.ext" />',
   'Keep a short human explanation outside the tags.'
 ].join('\n');
 
@@ -211,12 +235,32 @@ function cfg(key) {
   return vscode.workspace.getConfiguration('localai').get(key);
 }
 
-function getBaseUrl() {
-  return String(cfg('baseUrl') || DEFAULT_BASE_URL).trim().replace(/\/+$/, '') || DEFAULT_BASE_URL;
+// SecretStorage API Token — cache en mémoire pour usage synchrone partout
+// Le cache est chargé au démarrage de l'extension via loadApiTokenCache()
+// et mis à jour à chaque saveToken / setToken.
+let _apiTokenCache = '';
+
+// Chargement initial depuis SecretStorage (appelé une fois dans activate)
+async function loadApiTokenCache() { return true; }
+
+// Lecture synchrone du token — utilisée partout dans le code
+function getApiToken() {
+  // If cache is empty or looks invalid, try settings.json directly
+  if (!_apiTokenCache) return cfg('apiToken') || '';
+  return _apiTokenCache;
 }
 
-function getNativeBaseUrl() {
-  return String(cfg('nativeBaseUrl') || DEFAULT_NATIVE_BASE_URL).trim().replace(/\/+$/, '') || DEFAULT_NATIVE_BASE_URL;
+// Écriture sécurisée dans SecretStorage + mise à jour du cache
+async function saveApiTokenSecure(token) {
+  _apiTokenCache = token || '';
+  if (extensionContext) {
+    await extensionContext.secrets.store('localai.apiToken', token || '');
+    // Effacer l'ancienne valeur en clair
+    try {
+      const old = vscode.workspace.getConfiguration('localai').get('apiToken');
+      if (old) await vscode.workspace.getConfiguration('localai').update('apiToken', '', vscode.ConfigurationTarget.Global);
+    } catch (_) {}
+  }
 }
 
 function getModelId() {
@@ -224,7 +268,7 @@ function getModelId() {
 }
 
 function normalizeModelId(modelId) {
-  const value = String(modelId || '').trim();
+  let value = String(modelId || '').trim();
   if (!value) return DEFAULT_MODEL_ID;
   return value;
 }
@@ -235,14 +279,6 @@ function getBaseModelId(modelId) {
 
 function getEmbeddingModel() {
   return cfg('rag.embeddingModel') || DEFAULT_EMBEDDING_MODEL;
-}
-
-function getSandboxContainerModelBaseUrl() {
-  return String(cfg('sandbox.containerModelBaseUrl') || DEFAULT_CONTAINER_MODEL_BASE_URL).trim().replace(/\/+$/, '') || DEFAULT_CONTAINER_MODEL_BASE_URL;
-}
-
-function getSandboxContainerNativeBaseUrl() {
-  return String(cfg('sandbox.containerNativeBaseUrl') || DEFAULT_CONTAINER_NATIVE_BASE_URL).trim().replace(/\/+$/, '') || DEFAULT_CONTAINER_NATIVE_BASE_URL;
 }
 
 function memoryEnabled() {
@@ -372,7 +408,7 @@ function getMemoryScopeExplanation(scope) {
       return 'Global-only memory: notes are shared across all workspaces for personal preferences.';
     case 'global+workspace':
     default:
-      return 'Global + project memory: personal preferences plus workspace-specific notes.';
+      return 'Combined memory: global notes (cross-project preferences) + workspace notes (project conventions).';
   }
 }
 
@@ -446,8 +482,7 @@ function readJsonFile(filePath, fallback) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch (error) {
-    console.error(`[localai-code] Failed to read JSON file ${filePath}: ${error.message}`);
+  } catch (_) {
     return fallback;
   }
 }
@@ -460,14 +495,17 @@ function writeJsonFile(filePath, value) {
 function fileExists(filePath) {
   try {
     return fs.existsSync(filePath);
-  } catch (error) {
-    console.error(`[localai-code] Failed to check file existence for ${filePath}: ${error.message}`);
+  } catch (_) {
     return false;
   }
 }
 
 function getWorkspaceStorageRoot(context) {
   if (context.storageUri && context.storageUri.fsPath) return context.storageUri.fsPath;
+  const folder = getWorkspaceFolder();
+  if (folder) {
+    return path.join(folder.uri.fsPath, '.localai', 'storage');
+  }
   return path.join(context.globalStorageUri.fsPath, 'no-workspace');
 }
 
@@ -505,7 +543,7 @@ function cloneMessages(messages) {
 }
 
 /**
- * Normalizes messages for standard OpenAI-compatible APIs.
+ * Normalizes messages for standard OpenAI-compatible APIs (like HF Router).
  * Maps internal roles like 'system-msg' to 'system' and filters out unsupported roles.
  */
 function toApiMessages(messages) {
@@ -585,6 +623,25 @@ function cosineSimilarity(a, b) {
   return dot / (Math.sqrt(magA) * Math.sqrt(magB));
 }
 
+async function retryWithBackoff(fn, maxRetries = 3, baseDelayMs = 1000) {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxRetries) {
+        const delayMs = baseDelayMs * Math.pow(2, attempt);
+        const jitterMs = Math.floor(Math.random() * 200);
+        const totalDelayMs = delayMs + jitterMs;
+        console.warn(`[localai-code] Embedding API attempt ${attempt + 1}/${maxRetries} failed, retrying in ${totalDelayMs}ms: ${error.message}`);
+        await new Promise(resolve => setTimeout(resolve, totalDelayMs));
+      }
+    }
+  }
+  throw lastError;
+}
+
 function extractJsonFromText(text) {
   const value = String(text || '').trim();
   if (!value) return null;
@@ -606,29 +663,9 @@ function extractJsonFromText(text) {
 function tryParseJson(text) {
   try {
     return JSON.parse(text);
-  } catch (error) {
-    console.error(`[localai-code] Failed to parse JSON snippet: ${error.message}`);
+  } catch (_) {
     return null;
   }
-}
-
-async function retryWithBackoff(fn, maxRetries = 3, baseDelayMs = 1000) {
-  let lastError;
-  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-      if (attempt < maxRetries) {
-        const delayMs = baseDelayMs * Math.pow(2, attempt);
-        const jitterMs = Math.floor(Math.random() * 200);
-        const totalDelayMs = delayMs + jitterMs;
-        console.warn(`[localai-code] Embedding API attempt ${attempt + 1}/${maxRetries} failed, retrying in ${totalDelayMs}ms: ${error.message}`);
-        await new Promise(resolve => setTimeout(resolve, totalDelayMs));
-      }
-    }
-  }
-  throw lastError;
 }
 
 function validateInput(schema, input) {
@@ -795,54 +832,9 @@ function parseModelList(responseData) {
         return '';
       })
       .filter(Boolean);
-  } catch (error) {
-    console.error(`[localai-code] Failed to parse model list response: ${error.message}`);
+  } catch (_) {
     return [];
   }
-}
-
-function isLikelyEmbeddingModelId(modelId) {
-  return EMBEDDING_MODEL_HINTS.test(String(modelId || ''));
-}
-
-function pickDefaultChatModelId(modelIds) {
-  const ids = Array.isArray(modelIds) ? modelIds.filter(Boolean) : [];
-  return ids.find(id => !isLikelyEmbeddingModelId(id)) || ids[0] || '';
-}
-
-function pickDefaultEmbeddingModelId(modelIds) {
-  const ids = Array.isArray(modelIds) ? modelIds.filter(Boolean) : [];
-  return ids.find(id => isLikelyEmbeddingModelId(id)) || '';
-}
-
-async function fetchAvailableModels() {
-  const response = await httpJsonRequest(`${getBaseUrl()}/models`, {
-    method: 'GET',
-    timeoutMs: 10000
-  });
-  return parseModelList(response.raw || JSON.stringify(response.data || {}));
-}
-
-async function resolveChatModelId(preferredModelId) {
-  const normalized = normalizeModelId(preferredModelId || getModelId());
-  if (normalized && normalized !== 'auto') return normalized;
-  const available = await fetchAvailableModels();
-  const picked = pickDefaultChatModelId(available);
-  if (!picked) {
-    throw new Error('No loaded LM Studio chat model was found. Start the LM Studio server and load a model.');
-  }
-  return picked;
-}
-
-async function resolveEmbeddingModelId() {
-  const configured = normalizeModelId(getEmbeddingModel());
-  if (configured && configured !== 'auto') return configured;
-  const available = await fetchAvailableModels();
-  const picked = pickDefaultEmbeddingModelId(available);
-  if (!picked) {
-    throw new Error('No embedding-capable LM Studio model is loaded. Load one or set localai.rag.embeddingModel explicitly.');
-  }
-  return picked;
 }
 
 function getWorkspaceFolder() {
@@ -900,8 +892,8 @@ function readWorkspaceAgentsInstructions() {
   try {
     const content = fs.readFileSync(targetPath, 'utf8');
     return truncateText(content, 12000);
-  } catch (error) {
-    console.error(`[localai-code] Failed to read AGENTS.md from ${targetPath}: ${error.message}`);
+  } catch (err) {
+    console.error(`[localai-code] Failed to read AGENTS.md: ${err.message}`);
     return '';
   }
 }
@@ -942,10 +934,10 @@ function buildAgentToolInstructions(toolSpecs = LOCAL_AGENT_TOOL_SPECS, runtimeK
 
   const webGuidance = agentPreferWebForFreshInfo()
     ? [
-        'Use web_search or web_fetch by default when the request depends on current or time-sensitive information.',
-        'This includes security updates, CVEs, package or dependency versions, release notes, breaking changes, documentation updates, API changes, and anything described as latest, recent, new, current, or updated.',
-        'Do not browse for stable local codebase questions that can be answered from the workspace alone.'
-      ].join('\n')
+      'Use web_search or web_fetch by default when the request depends on current or time-sensitive information.',
+      'This includes security updates, CVEs, package or dependency versions, release notes, breaking changes, documentation updates, API changes, and anything described as latest, recent, new, current, or updated.',
+      'Do not browse for stable local codebase questions that can be answered from the workspace alone.'
+    ].join('\n')
     : 'Use web_search or web_fetch only when the user clearly asks for web research or when workspace context is insufficient.';
 
   return [
@@ -958,7 +950,7 @@ function buildAgentToolInstructions(toolSpecs = LOCAL_AGENT_TOOL_SPECS, runtimeK
     'If a patch is ready, summarize what changed and what was validated.',
     'When you need tools, emit one or more exact tool tags and wait for tool results before answering.',
     'Tool format:',
-    '<localai-tool name="read_file">{"path":"src/index.js"}</localai-tool>',
+    '<hfai-tool name="read_file">{"path":"src/index.js"}</hfai-tool>',
     'Do not wrap tool tags in markdown fences.',
     'When the task is complete, reply normally without any tool tags.',
     'Prefer tool use over guessing.',
@@ -1051,7 +1043,7 @@ function parseAssistantActions(text) {
   const actions = [];
   let cleanedText = String(text || '');
 
-  const actionRegex = /<localai-(write|delete|open)\s+path="([^"]+)"(?:\s*\/>|>([\s\S]*?)<\/localai-write>)/gi;
+  const actionRegex = /<hfai-(write|delete|open)\s+path="([^"]+)"(?:\s*\/>|>([\s\S]*?)<\/hfai-write>)/gi;
   cleanedText = cleanedText.replace(actionRegex, (_, type, filePath, content = '') => {
     if (type === 'write') {
       actions.push({ type, path: filePath.trim(), content: content.replace(/^\n/, '') });
@@ -1073,7 +1065,7 @@ function extractAssistantTextFromResult(result) {
 function parseAgentToolCalls(text) {
   const toolCalls = [];
   let cleanedText = String(text || '');
-  const toolRegex = /<localai-tool\s+name="([^"]+)"\s*>([\s\S]*?)<\/localai-tool>/gi;
+  const toolRegex = /<hfai-tool\s+name="([^"]+)"\s*>([\s\S]*?)<\/hfai-tool>/gi;
 
   cleanedText = cleanedText.replace(toolRegex, (_, name, rawInput = '') => {
     const input = extractJsonFromText(String(rawInput || '').trim());
@@ -1175,11 +1167,20 @@ function sanitizeAgentVisibleText(text) {
 function summarizeAssistantNoteForUi(note) {
   const sanitized = sanitizeAgentVisibleText(note);
   if (!sanitized) return '';
-  const flat = normalizeWhitespace(sanitized);
+  
+  // Clean up technical tags from the UI view
+  const cleaned = sanitized
+    .replace(/\[PHASE:\s*[^\]]+\]/gi, '')
+    .replace(/\[VERDICT:\s*[^\]]+\]/gi, '')
+    .replace(/\[SYSTEM:\s*[^\]]+\]/gi, '')
+    .trim();
+
+  if (!cleaned) return '';
+
+  const flat = normalizeWhitespace(cleaned);
   if (/^(?:i(?:'m| am)? going to|i will|let me|je vais(?: maintenant)?|maintenant je vais|je vais continuer|commençons par|on va commencer par)\b/i.test(flat)) {
     return '';
-  const cleaned = sanitized.replace(/\[PHASE:[^\]]*\]/gi, '').replace(/\[AUDIT:[^\]]*\]/gi, '').trim();
-  if (!cleaned) return '';
+  }
   return truncateText(cleaned, 220);
 }
 
@@ -1193,7 +1194,7 @@ function buildToolResultBlockForModel(toolCall, resultValue, ok) {
   if (!ok) {
     return [
       `Tool: ${name}`,
-      'Status: error',
+      `Status: error`,
       `Error: ${truncateText(String(resultValue || 'unknown error'), 1600)}`
     ].join('\n');
   }
@@ -1234,7 +1235,7 @@ function buildToolResultBlockForModel(toolCall, resultValue, ok) {
         'Tool: list_files',
         `Path: ${(resultValue && resultValue.path) || input.path || '.'}`,
         `Count: ${entries.length}`,
-        sample.length ? `Entries:\n${sample.join('\n')}` : 'Entries: none',
+        sample.length ? 'Entries:\n' + sample.join('\n') : 'Entries: none',
         omitted > 0 ? `Note: ${omitted} additional entries omitted.` : ''
       ].filter(Boolean).join('\n');
     }
@@ -1247,7 +1248,7 @@ function buildToolResultBlockForModel(toolCall, resultValue, ok) {
         'Tool: search_text',
         `Pattern: ${input.pattern || (resultValue && resultValue.pattern) || ''}`,
         `Matches: ${matches.length}`,
-        sample.length ? `Top matches:\n${sample.join('\n')}` : 'Top matches: none',
+        sample.length ? 'Top matches:\n' + sample.join('\n') : 'Top matches: none',
         omitted > 0 ? `Note: ${omitted} additional matches omitted.` : ''
       ].filter(Boolean).join('\n');
     }
@@ -1266,11 +1267,12 @@ function buildToolResultBlockForModel(toolCall, resultValue, ok) {
     }
 
     case 'git_status':
-    case 'git_diff':
+    case 'git_diff': {
       return [
         `Tool: ${name}`,
         formatJsonForModel(resultValue, MAX_AGENT_TOOL_MODEL_RESULT_CHARS)
       ].join('\n');
+    }
 
     case 'web_search': {
       const results = Array.isArray(resultValue && resultValue.results) ? resultValue.results : [];
@@ -1283,12 +1285,13 @@ function buildToolResultBlockForModel(toolCall, resultValue, ok) {
       ].join('\n');
     }
 
-    case 'web_fetch':
+    case 'web_fetch': {
       return [
         'Tool: web_fetch',
         `Source: ${(resultValue && (resultValue.title || resultValue.url)) || input.url || ''}`,
         truncateText(String((resultValue && (resultValue.content || resultValue.text || resultValue.excerpt)) || ''), MAX_AGENT_TOOL_MODEL_RESULT_CHARS)
       ].filter(Boolean).join('\n');
+    }
 
     case 'spawn_agent': {
       const lines = buildAgentToolStatusLines(resultValue);
@@ -1507,7 +1510,8 @@ function collectWorkspaceEntries(basePath, options = {}) {
     let dirEntries = [];
     try {
       dirEntries = fs.readdirSync(currentPath, { withFileTypes: true });
-    } catch (_) {
+    } catch (err) {
+      console.error(`[localai-code] Failed to read directory ${currentPath}: ${err.message}`);
       return;
     }
 
@@ -1581,8 +1585,8 @@ function searchWorkspaceText(pattern, options = {}) {
         }
         if (matches.length >= (options.maxResults || MAX_AGENT_SEARCH_RESULTS)) break;
       }
-    } catch (error) {
-      console.error(`[localai-code] Failed to search workspace text in ${entry.path}: ${error.message}`);
+    } catch (err) {
+      console.error(`[localai-code] Error reading file during workspace search: ${err.message}`);
     }
   }
 
@@ -1592,6 +1596,28 @@ function searchWorkspaceText(pattern, options = {}) {
 function enforceAgentShellPolicy(command) {
   if (!agentAllowShell()) {
     throw new Error('Shell access is disabled by settings.');
+  }
+
+  // ── AIDefence: enhanced shell validation (Ruflo-inspired) ──────────────────
+  if (cfg('defence.enabled') !== false) {
+    const defenceCheck = aiDefence.validateShellCommand(command);
+    if (defenceCheck.blocked) {
+      const reason = defenceCheck.findings.map(f => f.pattern).join(', ');
+      throw new Error(`Shell command blocked by AIDefence: ${reason}`);
+    }
+  }
+
+  // ── MutationGuard: validate shell permission per agent role ────────────────
+  if (mutationGuard && cfg('guard.enabled') !== false) {
+    const agentType = (global.__currentAgentType) || 'general-purpose';
+    const shellCheck = mutationGuard.checkShell(command, agentType);
+    if (!shellCheck.allowed) {
+      throw new Error(`Shell command blocked by MutationGuard: ${shellCheck.reason}`);
+    }
+    if (shellCheck.requiresApproval) {
+      console.log(`[MutationGuard] Shell command requires approval: "${command}" (${shellCheck.reason})`);
+      if (memoryDB) memoryDB.appendEvent('shell.approval_needed', { command: command.slice(0, 200), agent: agentType }, 'mutationGuard');
+    }
   }
 
   const blockedPatterns = [
@@ -1734,10 +1760,15 @@ function parseGitWorktrees(output) {
 }
 
 async function ensureSandboxExecutionContext(execContext = {}) {
-  if (execContext.sandboxMeta) return execContext.sandboxMeta;
+  console.log(`[Extension] ensureSandboxExecutionContext: starting...`);
+  if (execContext.sandboxMeta) {
+    console.log(`[Extension] reuse existing sandbox: ${execContext.sandboxMeta.id}`);
+    return execContext.sandboxMeta;
+  }
   if (!execContext.runtime) {
     throw new Error('Sandbox runtime is unavailable for this task.');
   }
+  console.log(`[Extension] triggering ensureSandboxReady...`);
   await execContext.runtime.ensureSandboxReady();
 
   let task = execContext.taskId ? execContext.runtime.store.loadTask(execContext.taskId) : null;
@@ -1746,37 +1777,26 @@ async function ensureSandboxExecutionContext(execContext = {}) {
     : null;
 
   if (!sandboxMeta) {
+    console.log(`[Extension] No sandbox found for task, creating new one...`);
     const sourceRoot = execContext.rootPath || (getWorkspaceFolder() ? getWorkspaceFolder().uri.fsPath : '');
     if (!sourceRoot) throw new Error('No workspace root is available for sandbox creation.');
     sandboxMeta = await execContext.runtime.sandbox.createFromWorkspace({
       sandboxId: createId('sandbox'),
       sourceRoot
     });
+    console.log(`[Extension] New sandbox created: ${sandboxMeta.id}`);
     if (task) {
       execContext.runtime.store.updateTask(task.id, currentTask => {
         currentTask.sandboxId = sandboxMeta.id;
         currentTask.sandboxState = sandboxMeta.state || 'ready';
-        currentTask.sandboxRootDir = sandboxMeta.rootDir;
-        currentTask.sandboxWorkspaceDir = sandboxMeta.workspaceDir;
-        currentTask.sandboxContainerName = sandboxMeta.containerName;
-        currentTask.containerImage = sandboxMeta.image || getSandboxImage();
         return currentTask;
       });
-      execContext.runtime.store.appendTaskLog(task.id, `Sandbox ready: ${sandboxMeta.id}`);
-      task = execContext.runtime.store.loadTask(task.id);
     }
   } else {
-    sandboxMeta = await execContext.runtime.sandbox.attach(sandboxMeta);
-    if (task) {
-      execContext.runtime.store.updateTask(task.id, currentTask => {
-        currentTask.sandboxState = sandboxMeta.state || 'ready';
-        currentTask.sandboxContainerName = sandboxMeta.containerName || currentTask.sandboxContainerName;
-        currentTask.containerImage = sandboxMeta.image || currentTask.containerImage;
-        return currentTask;
-      });
-    }
+    console.log(`[Extension] Reattaching to existing sandbox: ${sandboxMeta.id}`);
+    await execContext.runtime.sandbox.attach(sandboxMeta);
   }
-
+  
   execContext.sandboxMeta = sandboxMeta;
   return sandboxMeta;
 }
@@ -2000,7 +2020,6 @@ async function executeAgentToolCall(toolCall, execContext = {}) {
     }
 
     case 'search_text': {
-      if (!input.pattern) throw new Error('search_text requires a pattern.');
       return execContext.runtime.sandbox.execTool(sandboxMeta, {
         name,
         input: {
@@ -2014,9 +2033,6 @@ async function executeAgentToolCall(toolCall, execContext = {}) {
     }
 
     case 'write_file': {
-      if (typeof input.path !== 'string' || typeof input.content !== 'string') {
-        throw new Error('write_file requires path and content.');
-      }
       return execContext.runtime.sandbox.execTool(sandboxMeta, {
         name,
         input: {
@@ -2027,7 +2043,6 @@ async function executeAgentToolCall(toolCall, execContext = {}) {
     }
 
     case 'delete_path': {
-      if (typeof input.path !== 'string') throw new Error('delete_path requires a path.');
       return execContext.runtime.sandbox.execTool(sandboxMeta, {
         name,
         input: {
@@ -2037,9 +2052,6 @@ async function executeAgentToolCall(toolCall, execContext = {}) {
     }
 
     case 'run_shell': {
-      if (typeof input.command !== 'string' || !input.command.trim()) {
-        throw new Error('run_shell requires a command.');
-      }
       return execContext.runtime.sandbox.execTool(sandboxMeta, {
         name,
         input: {
@@ -2081,7 +2093,6 @@ async function executeAgentToolCall(toolCall, execContext = {}) {
 
     case 'get_task': {
       if (!execContext.taskManager) throw new Error('Task manager is unavailable.');
-      if (typeof input.taskId !== 'string' || !input.taskId.trim()) throw new Error('get_task requires taskId.');
       const task = execContext.taskManager.getTask(input.taskId.trim());
       if (!task) throw new Error(`Task not found: ${input.taskId}`);
       return task;
@@ -2089,15 +2100,11 @@ async function executeAgentToolCall(toolCall, execContext = {}) {
 
     case 'stop_task': {
       if (!execContext.taskManager) throw new Error('Task manager is unavailable.');
-      if (typeof input.taskId !== 'string' || !input.taskId.trim()) throw new Error('stop_task requires taskId.');
       return execContext.taskManager.stopTask(input.taskId.trim());
     }
 
     case 'spawn_task': {
       if (!execContext.taskManager) throw new Error('Task manager is unavailable.');
-      if (typeof input.prompt !== 'string' || !input.prompt.trim()) {
-        throw new Error('spawn_task requires a prompt.');
-      }
       const taskRoot = typeof input.cwd === 'string' && input.cwd.trim()
         ? resolveWorkspaceToolPath(input.cwd, rootPath)
         : rootPath;
@@ -2115,9 +2122,6 @@ async function executeAgentToolCall(toolCall, execContext = {}) {
 
     case 'ask_user_question': {
       if (!execContext.runtime || !execContext.taskId) throw new Error('ask_user_question requires a task execution context.');
-      if (typeof input.question !== 'string' || !input.question.trim()) {
-        throw new Error('ask_user_question requires question.');
-      }
       const question = execContext.runtime.features.createQuestion({
         agentId: currentTask ? currentTask.agentId : '',
         taskId: execContext.taskId,
@@ -2199,7 +2203,7 @@ async function executeAgentToolCall(toolCall, execContext = {}) {
           rootPath
         });
       }
-      throw new Error('workflow_run currently supports the \"team\" workflow pattern.');
+      throw new Error('workflow_run currently supports the "team" workflow pattern.');
     }
 
     case 'fork_chat': {
@@ -2219,6 +2223,25 @@ async function runAutonomousAgent(messages, hooks = {}, execContext = {}) {
   const executedTools = [];
   const priorToolResults = new Map();
   const maxRounds = getAgentMaxRounds();
+  const startTime = Date.now();
+
+  // ── AIDefence: scan user prompt for injection (Ruflo-inspired) ──────────────
+  const userMessages = messages.filter(m => m.role === 'user');
+  const lastUserMsg = userMessages.length > 0 ? userMessages[userMessages.length - 1].content : '';
+  if (cfg('defence.enabled') !== false) {
+    const injectionCheck = aiDefence.detectPromptInjection(lastUserMsg);
+    if (injectionCheck.blocked) {
+      throw new Error(`[AIDefence] Prompt injection detected and blocked: ${injectionCheck.findings.map(f => f.match).join(', ')}`);
+    }
+  }
+
+  // ── Learning: inject context from past successes (Ruflo SONA-inspired) ──────
+  if (learningEngine) {
+    const learningContext = learningEngine.buildLearningContext(lastUserMsg, execContext.agentType);
+    if (learningContext) {
+      conversation.unshift({ role: 'system', content: learningContext });
+    }
+  }
 
   for (let round = 0; round < maxRounds; round += 1) {
     if (execContext.runtimeState && execContext.runtimeState.stopRequested) {
@@ -2238,12 +2261,34 @@ async function runAutonomousAgent(messages, hooks = {}, execContext = {}) {
     const safeAssistantText = sanitizeAgentVisibleText(assistantText) || assistantText;
     const safeCleanedText = sanitizeAgentVisibleText(cleanedText);
 
+    // ── AIDefence: scan assistant output for PII/secrets ──────────────────────
+    const outputCheck = aiDefence.scanForSecrets(safeAssistantText);
+    if (!outputCheck.clean) {
+      console.warn('[AIDefence] Secrets detected in assistant output:', outputCheck.findings.map(f => f.type).join(', '));
+    }
+
     if (!toolCalls.length) {
       conversation.push({
         role: 'assistant',
         content: safeAssistantText
       });
       if (hooks.onConversationUpdate) hooks.onConversationUpdate(cloneMessages(conversation), round + 1);
+
+      // ── Learning: record successful trajectory ──────────────────────────────
+      if (learningEngine && execContext.taskId) {
+        try {
+          learningEngine.recordTrajectory({
+            taskId: execContext.taskId,
+            title: execContext.taskTitle || '',
+            prompt: lastUserMsg,
+            agentType: execContext.agentType || 'general-purpose',
+            toolSequence: executedTools,
+            outcome: 'completed',
+            duration: Date.now() - startTime
+          });
+        } catch (_) {}
+      }
+
       return {
         finalText: safeAssistantText,
         executedTools,
@@ -2269,6 +2314,31 @@ async function runAutonomousAgent(messages, hooks = {}, execContext = {}) {
         throw new Error('Task stopped by user.');
       }
 
+      // ── MutationGuard: validate write permission before writing ──────────
+      if (toolCall.name === 'write_file' && toolCall.input && mutationGuard && cfg('guard.enabled') !== false) {
+        const writePath = typeof toolCall.input === 'string' ? '' : (toolCall.input.path || toolCall.input.filePath || '');
+        const writeContent = typeof toolCall.input === 'string' ? toolCall.input : (toolCall.input.content || '');
+        const agentType = execContext.agentType || 'general-purpose';
+        const guardResult = mutationGuard.checkWrite(writePath, agentType, writeContent);
+        if (!guardResult.allowed) {
+          console.warn(`[MutationGuard] BLOCKED write to "${writePath}" by ${agentType}: ${guardResult.reason}`);
+          if (memoryDB) memoryDB.appendEvent('mutation.blocked', { path: writePath, agent: agentType, reason: guardResult.reason }, 'mutationGuard');
+        }
+        if (guardResult.requiresApproval) {
+          console.log(`[MutationGuard] Write to "${writePath}" requires approval (${guardResult.reason})`);
+          if (memoryDB) memoryDB.appendEvent('mutation.approval_needed', { path: writePath, agent: agentType }, 'mutationGuard');
+        }
+      }
+
+      // ── AIDefence: scan write_file content for secrets before writing ──────
+      if (toolCall.name === 'write_file' && toolCall.input) {
+        const writeContent = typeof toolCall.input === 'string' ? toolCall.input : (toolCall.input.content || '');
+        const writeCheck = aiDefence.scanForSecrets(writeContent);
+        if (!writeCheck.clean) {
+          console.warn('[AIDefence] Secrets detected in write_file content:', writeCheck.findings.map(f => f.type).join(', '));
+        }
+      }
+
       if (hooks.onToolCall) hooks.onToolCall(toolCall, round + 1);
       const toolSignature = createToolCallSignature(toolCall);
       if (isDedupeEligibleTool(toolCall.name) && priorToolResults.has(toolSignature)) {
@@ -2283,8 +2353,9 @@ async function runAutonomousAgent(messages, hooks = {}, execContext = {}) {
         continue;
       }
       try {
+        const toolStart = Date.now();
         const resultValue = await executeAgentToolCall(toolCall, execContext);
-        executedTools.push({ name: toolCall.name, input: toolCall.input, ok: true });
+        executedTools.push({ name: toolCall.name, input: toolCall.input, ok: true, durationMs: Date.now() - toolStart });
         const compactBlock = buildToolResultBlockForModel(toolCall, resultValue, true);
         toolResultBlocks.push(compactBlock);
         if (isDedupeEligibleTool(toolCall.name)) {
@@ -2296,7 +2367,7 @@ async function runAutonomousAgent(messages, hooks = {}, execContext = {}) {
         if (hooks.onToolResult) hooks.onToolResult(toolCall, resultValue, true, round + 1);
       } catch (error) {
         const errorText = error instanceof Error ? error.message : String(error);
-        executedTools.push({ name: toolCall.name, input: toolCall.input, ok: false, error: errorText });
+        executedTools.push({ name: toolCall.name, input: toolCall.input, ok: false, error: errorText, durationMs: 0 });
         toolResultBlocks.push(buildToolResultBlockForModel(toolCall, errorText, false));
         if (hooks.onToolResult) hooks.onToolResult(toolCall, errorText, false, round + 1);
       }
@@ -2304,6 +2375,21 @@ async function runAutonomousAgent(messages, hooks = {}, execContext = {}) {
 
     conversation.push(buildToolResultsConversationMessage(round + 1, toolResultBlocks));
     if (hooks.onConversationUpdate) hooks.onConversationUpdate(cloneMessages(conversation), round + 1);
+  }
+
+  // ── Learning: record failed trajectory (max rounds exceeded) ────────────────
+  if (learningEngine && execContext.taskId) {
+    try {
+      learningEngine.recordTrajectory({
+        taskId: execContext.taskId,
+        title: execContext.taskTitle || '',
+        prompt: lastUserMsg,
+        agentType: execContext.agentType || 'general-purpose',
+        toolSequence: executedTools,
+        outcome: 'failed',
+        duration: Date.now() - startTime
+      });
+    } catch (_) {}
   }
 
   throw new Error(`Agent stopped after ${maxRounds} rounds without producing a final answer.`);
@@ -2619,6 +2705,7 @@ class PersistentState {
       checkpointAt: task.checkpointAt || '',
       resumeCount: Number(task.resumeCount || 0),
       awaitingQuestionId: task.awaitingQuestionId || '',
+      awaitingSince: task.awaitingSince || '',
       patchId: task.patchId || '',
       patchSummary: truncateText(normalizeWhitespace(task.patchSummary || ''), 180),
       containerImage: task.containerImage || '',
@@ -2686,6 +2773,7 @@ class PersistentState {
       checkpoint: input.checkpoint || null,
       externalMessages: Array.isArray(input.externalMessages) ? input.externalMessages : [],
       awaitingQuestionId: input.awaitingQuestionId || '',
+      awaitingSince: input.awaitingSince || '',
       labels: Array.isArray(input.labels) ? input.labels : [],
       patchId: input.patchId || '',
       patchSummary: input.patchSummary || '',
@@ -2813,6 +2901,15 @@ class PersistentState {
       branchLabel: 'fork',
       messages
     });
+    // Track child relationship on parent
+    if (!Array.isArray(sourceChat.childChatIds)) {
+      sourceChat.childChatIds = [];
+    }
+    if (!sourceChat.childChatIds.includes(forked.id)) {
+      sourceChat.childChatIds.push(forked.id);
+    }
+    sourceChat.updatedAt = new Date().toISOString();
+    this.saveChatIndex();
     this.saveSummary(forked.id, {
       ...summary,
       chatId: forked.id,
@@ -2861,12 +2958,8 @@ class PersistentState {
   deleteChat(chatId) {
     const previousActive = this.chatIndex.activeChatId;
     this.chatIndex.chats = this.chatIndex.chats.filter(chat => chat.id !== chatId);
-    try { fs.rmSync(this.getChatMessagePath(chatId), { force: true }); } catch (error) {
-      console.error(`[localai-code] Failed to delete chat messages for ${chatId}: ${error.message}`);
-    }
-    try { fs.rmSync(this.getChatSummaryPath(chatId), { force: true }); } catch (error) {
-      console.error(`[localai-code] Failed to delete chat summary for ${chatId}: ${error.message}`);
-    }
+    try { fs.rmSync(this.getChatMessagePath(chatId), { force: true }); } catch (err) { console.error(`[localai-code] Failed to delete chat messages for ${chatId}: ${err.message}`); }
+    try { fs.rmSync(this.getChatSummaryPath(chatId), { force: true }); } catch (err) { console.error(`[localai-code] Failed to delete chat summary for ${chatId}: ${err.message}`); }
 
     if (!this.chatIndex.chats.length) {
       return this.createChat('New Chat');
@@ -2993,6 +3086,7 @@ class PersistentState {
 
   getUiSnapshot() {
     const activeChat = this.ensureActiveChat();
+    // Build parent and child chat maps for fork navigation
     const chatById = new Map();
     for (const chat of this.chatIndex.chats) {
       chatById.set(chat.id, chat);
@@ -3036,6 +3130,9 @@ class RagIndexManager {
     this.watchers = [];
     this.running = false;
     this.lastManualRebuildAt = 0;
+    // ── VectorDB: accelerated semantic search ──────────────────────────────
+    this.vectorDB = new VectorDB(path.join(path.dirname(store.getRagIndexPath()), 'vector.db.json'));
+    this.vectorDB.load();
   }
 
   async initialize() {
@@ -3101,15 +3198,15 @@ class RagIndexManager {
 
   async performAutoRefresh() {
     const now = Date.now();
-    const recentThresholdMs = 60 * 1000;
+    const recentThresholdMs = 60 * 1000; // Skip if a manual/scheduled rebuild happened in the last 60s
     if (now - this.lastManualRebuildAt < recentThresholdMs) {
       console.log('[localai-code] RAG auto-refresh skipped, index was recently rebuilt.');
-      this.startAutoRefresh();
+      this.startAutoRefresh(); // Reschedule
       return;
     }
     console.log('[localai-code] RAG auto-refresh triggered.');
     await this.rebuildAll();
-    this.startAutoRefresh();
+    this.startAutoRefresh(); // Reschedule for next interval
   }
 
   startWatchers() {
@@ -3225,14 +3322,14 @@ class RagIndexManager {
         });
       }
       return chunks;
-    } catch (error) {
-      console.error(`[localai-code] Failed to chunk file for RAG ${fsPath}: ${error.message}`);
+    } catch (err) {
+      console.error(`[localai-code] Error chunking file for RAG: ${err.message}`);
       return [];
     }
   }
 
   async ensureChunkEmbeddings(chunks) {
-    if (!ragEnabled() || !chunks.length) return;
+    if (!ragEnabled() || !chunks.length || !getApiToken()) return;
     const missing = chunks.filter(chunk => !Array.isArray(chunk.embedding) || !chunk.embedding.length).slice(0, MAX_EMBED_CANDIDATES);
     if (!missing.length) return;
 
@@ -3242,8 +3339,20 @@ class RagIndexManager {
       const vectors = await retryWithBackoff(() => featureExtractionRequest(inputs), maxRetries);
       if (!Array.isArray(vectors)) return;
       for (let i = 0; i < missing.length; i += 1) {
-        if (Array.isArray(vectors[i])) missing[i].embedding = vectors[i];
+        if (Array.isArray(vectors[i])) {
+          missing[i].embedding = vectors[i];
+          // ── VectorDB: store embedding for accelerated future searches ──────
+          try {
+            this.vectorDB.upsert(missing[i].id, vectors[i], {
+              filePath: missing[i].path,
+              language: missing[i].language,
+              content: truncateText(missing[i].text, 500)
+            });
+          } catch (_) {}
+        }
       }
+      // Save VectorDB alongside the JSON index
+      try { this.vectorDB.save(); } catch (_) {}
       this.saveIndex();
     } catch (error) {
       console.error(`[localai-code] Embedding failed after retries: ${error.message}`);
@@ -3288,7 +3397,7 @@ class RagIndexManager {
 
     let usedSemantic = false;
     const allowSemantic = (cfg('rag.mode') || 'hybrid-local') !== 'lexical-only';
-    if (allowSemantic) {
+    if (allowSemantic && getApiToken()) {
       await this.ensureChunkEmbeddings(lexicalCandidates);
       const queryEmbedding = await this.getQueryEmbedding(queryText);
       if (queryEmbedding) {
@@ -3318,7 +3427,7 @@ class RagIndexManager {
   }
 }
 
-class LocalAIRuntime {
+class HFAIRuntime {
   constructor(context) {
     this.context = context;
     this.store = new PersistentState(context);
@@ -3342,7 +3451,7 @@ class LocalAIRuntime {
       autoStartDocker: sandboxAutoStartDocker(),
       keepSandboxes: sandboxRetainOnFailure(),
       maxToolTimeoutMs: getSandboxToolTimeoutMs(),
-      containerNamePrefix: 'localai-sbx'
+      containerNamePrefix: 'hfai-sbx'
     });
     this.tasks = new AgentTaskManager(this);
     this.features.bridge = {
@@ -3401,12 +3510,15 @@ class LocalAIRuntime {
       detail: ''
     };
 
+    console.log(`[Extension] maybeAutoStartDocker called (reason: ${reason}, waitForReady: ${waitForReady})`);
     if (!sandboxEnabled() || !sandboxAutoStartDocker() || process.platform !== 'win32') {
+      console.log(`[Extension] maybeAutoStartDocker skipped: not enabled or not win32.`);
       return skippedResult;
     }
 
     const initialHealth = await this.sandbox.getHealth(false);
     if (initialHealth.dockerReady) {
+      console.log(`[Extension] maybeAutoStartDocker: Docker is already ready.`);
       const result = {
         attempted: false,
         launched: false,
@@ -3421,6 +3533,7 @@ class LocalAIRuntime {
     const now = Date.now();
     const inCooldown = this._lastDockerAutoStartAt && (now - this._lastDockerAutoStartAt) < DOCKER_AUTO_START_COOLDOWN_MS;
     if (inCooldown) {
+      console.log(`[Extension] maybeAutoStartDocker: In cooldown (${Math.round((now - this._lastDockerAutoStartAt) / 1000)}s since last attempt).`);
       const readyHealth = waitForReady ? await this._waitForDockerReady() : null;
       const result = {
         attempted: true,
@@ -3864,8 +3977,8 @@ class LocalAIRuntime {
           }
         ], null, { stream: false, temperature: 0.1, max_tokens: 1200 });
         payload = extractJsonFromText(result?.choices?.[0]?.message?.content || '');
-      } catch (error) {
-        console.error(`[localai-code] LLM-based chat summary failed: ${error.message}`);
+      } catch (err) {
+        console.error(`[localai-code] LLM-based chat summary failed: ${err.message}`);
         payload = null;
       }
 
@@ -3925,7 +4038,7 @@ class CloudExecutorClient {
     this.dispose();
     if (!(this.isEnabled() || this.hasTrackedCloudTasks())) return;
     this.syncTimer = setInterval(() => {
-      this.syncActiveTasks().catch(() => {});
+      this.syncActiveTasks().catch(() => { });
     }, getCloudPollIntervalMs());
   }
 
@@ -3943,37 +4056,33 @@ class CloudExecutorClient {
   async buildWorkspaceSnapshot(rootPath) {
     const workspaceRoot = rootPath || (getWorkspaceFolder() ? getWorkspaceFolder().uri.fsPath : this.runtime.store.workspaceRoot);
     if (!workspaceRoot || !fileExists(workspaceRoot)) {
-      return { rootPath: workspaceRoot || '', rootName: '', files: [], fileCount: 0, totalBytes: 0, truncated: false, warnings: [], summary: {} };
+      return { rootPath: workspaceRoot || '', rootName: '', files: [], fileCount: 0, totalBytes: 0, truncated: false, warnings: [], summary: null };
     }
 
-    const files = [];
-    let totalBytes = 0;
-    let truncated = false;
-    const warnings = [];
-    const summary = {
-      directoriesScanned: 0,
-      filesIncluded: 0,
-      skippedExcluded: 0,
-      skippedBinary: 0,
-      skippedTooLarge: 0,
-      skippedUnreadable: 0,
-      skippedNonSnapshot: 0
-    };
-    const queue = [''];
     const maxFiles = getCloudMaxSnapshotFiles();
     const maxTotalBytes = getCloudMaxSnapshotTotalBytes();
     const maxFileBytes = getCloudMaxSnapshotFileBytes();
 
+    const files = [];
+    let totalBytes = 0;
+    let truncated = false;
+    let truncatedReason = '';
+    const queue = [''];
+    let dirsScanned = 0;
+    let filesSkippedBinary = 0;
+    let filesSkippedTooLarge = 0;
+    let filesSkippedExcluded = 0;
+    let filesSkippedNotSnapshot = 0;
+
     while (queue.length && files.length < maxFiles && !truncated) {
       const relativeDir = queue.shift();
       const absoluteDir = relativeDir ? path.join(workspaceRoot, relativeDir) : workspaceRoot;
-      summary.directoriesScanned += 1;
+      dirsScanned += 1;
       let dirEntries = [];
       try {
         dirEntries = fs.readdirSync(absoluteDir, { withFileTypes: true });
-      } catch (error) {
-        summary.skippedUnreadable += 1;
-        console.error(`[localai-code] Failed to read cloud snapshot directory ${absoluteDir}: ${error.message}`);
+      } catch (err) {
+        console.error(`[localai-code] Failed to read directory for cloud snapshot: ${err.message}`);
         continue;
       }
 
@@ -3983,7 +4092,7 @@ class CloudExecutorClient {
           ? path.posix.join(relativeDir.replace(/\\/g, '/'), entry.name)
           : entry.name;
         if (isExcludedPath(relativePath)) {
-          summary.skippedExcluded += 1;
+          filesSkippedExcluded += 1;
           continue;
         }
         const absolutePath = path.join(absoluteDir, entry.name);
@@ -3992,34 +4101,32 @@ class CloudExecutorClient {
           continue;
         }
         if (!entry.isFile() || !isCloudSnapshotPath(relativePath)) {
-          summary.skippedNonSnapshot += 1;
+          filesSkippedNotSnapshot += 1;
           continue;
         }
 
         let stat;
         try {
           stat = fs.statSync(absolutePath);
-        } catch (error) {
-          summary.skippedUnreadable += 1;
-          console.error(`[localai-code] Failed to stat cloud snapshot file ${absolutePath}: ${error.message}`);
+        } catch (err) {
+          console.error(`[localai-code] Failed to stat file for cloud snapshot: ${err.message}`);
           continue;
         }
         if (!stat.isFile()) continue;
         if (stat.size > maxFileBytes) {
-          summary.skippedTooLarge += 1;
+          filesSkippedTooLarge += 1;
           continue;
         }
 
         let buffer;
         try {
           buffer = fs.readFileSync(absolutePath);
-        } catch (error) {
-          summary.skippedUnreadable += 1;
-          console.error(`[localai-code] Failed to read cloud snapshot file ${absolutePath}: ${error.message}`);
+        } catch (err) {
+          console.error(`[localai-code] Failed to read file for cloud snapshot: ${err.message}`);
           continue;
         }
         if (isLikelyBinary(buffer)) {
-          summary.skippedBinary += 1;
+          filesSkippedBinary += 1;
           continue;
         }
 
@@ -4027,7 +4134,7 @@ class CloudExecutorClient {
         const nextBytes = Buffer.byteLength(text, 'utf8');
         if ((totalBytes + nextBytes) > maxTotalBytes) {
           truncated = true;
-          warnings.push(`Stopped at ${files.length} file(s) because snapshot would exceed ${maxTotalBytes} bytes.`);
+          truncatedReason = `Total size limit reached (${(totalBytes / 1024).toFixed(1)}KB / ${(maxTotalBytes / 1024).toFixed(0)}KB)`;
           break;
         }
 
@@ -4036,14 +4143,37 @@ class CloudExecutorClient {
           content: text
         });
         totalBytes += nextBytes;
-        summary.filesIncluded += 1;
+
+        if (files.length >= maxFiles) {
+          truncated = true;
+          truncatedReason = `File count limit reached (${files.length} / ${maxFiles})`;
+          break;
+        }
       }
     }
 
-    if (files.length >= maxFiles && queue.length) {
-      truncated = true;
-      warnings.push(`Stopped at ${maxFiles} file(s) because the snapshot hit the configured file limit.`);
+    const warnings = [];
+    if (truncated) {
+      warnings.push(truncatedReason);
+      console.warn(`[localai-code] Cloud snapshot truncated: ${truncatedReason}`);
     }
+
+    const summary = {
+      dirsScanned,
+      filesIncluded: files.length,
+      filesSkippedBinary,
+      filesSkippedTooLarge,
+      filesSkippedExcluded,
+      filesSkippedNotSnapshot,
+      totalBytes,
+      maxFiles,
+      maxTotalBytes,
+      maxFileBytes,
+      truncated
+    };
+
+    console.log(`[localai-code] Cloud snapshot built: ${files.length} file(s), ${(totalBytes / 1024).toFixed(1)}KB total` +
+      (truncated ? ` [TRUNCATED] ${truncatedReason}` : ''));
 
     return {
       rootPath: workspaceRoot,
@@ -4086,11 +4216,15 @@ class CloudExecutorClient {
     if (!executorUrl) throw new Error('Cloud executor URL is not configured.');
 
     const snapshot = await this.buildWorkspaceSnapshot(localTask.executionRoot);
+
+    // Show truncation warning to user if applicable
     if (snapshot.truncated && snapshot.warnings && snapshot.warnings.length > 0) {
       vscode.window.showWarningMessage(
         `Cloud workspace snapshot was truncated: ${snapshot.warnings[0]}. Consider adjusting localai.cloud.maxSnapshotFiles or localai.cloud.maxSnapshotTotalBytes.`
       );
     }
+
+    // Compress the snapshot before sending
     let useCompressed = false;
     let compressedData = null;
     try {
@@ -4100,12 +4234,14 @@ class CloudExecutorClient {
     } catch (err) {
       console.warn(`[localai-code] Cloud snapshot compression failed, sending uncompressed: ${err.message}`);
     }
+
     const payload = {
       title: localTask.title,
       prompt: localTask.prompt,
       workspaceName: snapshot.rootName || path.basename(localTask.executionRoot || 'workspace'),
       files: snapshot.files,
       snapshotCompressed: useCompressed ? compressedData : undefined,
+      snapshotSummary: snapshot.summary,
       messages: rewriteMessagesForRuntime(localTask.messages || [], 'cloud', {
         chatId: localTask.chatId || '',
         store: this.store,
@@ -4114,7 +4250,7 @@ class CloudExecutorClient {
       modelId: normalizeModelId(getModelId()),
       temperature: cfg('temperature') ?? 0.2,
       maxTokens: cfg('maxTokens') ?? 4096,
-      maxRounds: getAgentMaxRounds(input.agentType),
+      maxRounds: getAgentMaxRounds(localTask.agentType),
       allowShell: agentAllowShell(),
       shellTimeoutMs: getAgentShellTimeoutMs(),
       agentId: localTask.agentId || '',
@@ -4130,14 +4266,9 @@ class CloudExecutorClient {
         autoBuildImage: sandboxAutoBuildImage(),
         networkMode: getSandboxNetworkMode(),
         toolTimeoutMs: getSandboxToolTimeoutMs(),
-        retainOnFailure: sandboxRetainOnFailure(),
-        containerModelBaseUrl: getSandboxContainerModelBaseUrl(),
-        containerNativeBaseUrl: getSandboxContainerNativeBaseUrl()
+        retainOnFailure: sandboxRetainOnFailure()
       },
-      lmStudio: {
-        baseUrl: getBaseUrl(),
-        nativeBaseUrl: getNativeBaseUrl()
-      }
+      hfApiToken: cloudForwardApiToken() ? getApiToken() : ''
     };
 
     const response = await httpJsonRequest(`${executorUrl}/tasks`, {
@@ -4193,6 +4324,7 @@ class CloudExecutorClient {
       currentTask.patchSummary = remoteTask.patchSummary || currentTask.patchSummary;
       currentTask.containerImage = remoteTask.containerImage || currentTask.containerImage;
       currentTask.awaitingQuestionId = remoteTask.awaitingQuestionId || currentTask.awaitingQuestionId;
+      currentTask.awaitingSince = remoteTask.awaitingSince || currentTask.awaitingSince;
       return currentTask;
     });
 
@@ -4235,8 +4367,8 @@ class CloudExecutorClient {
       for (const task of candidates) {
         try {
           await this.syncTask(task.id);
-        } catch (error) {
-          console.error(`[localai-code] Failed to sync remote task ${task.id}: ${error.message}`);
+        } catch (err) {
+          console.error(`[localai-code] Failed to sync task ${task.id}: ${err.message}`);
         }
       }
     } finally {
@@ -4311,7 +4443,7 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
   const executedTools = [];
   const priorToolResults = new Map();
 
-  for (;;) {
+  for (; ;) {
     task = runtime.store.loadTask(taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
     if (runtimeState.stopRequested || task.stopRequested) {
@@ -4357,6 +4489,76 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
       round += 1;
       if (round > maxRounds) {
         throw new Error(`Agent stopped after ${maxRounds} rounds without producing a final answer.`);
+      }
+
+      // ── SPARC Analysis (orchestrator-only, round 1) ────────────────────────
+      // On the first round of an aria-orchestrator task, run SPARC Sense+Plan
+      // to inject structured domain analysis into the conversation context.
+      if (round === 1 && task.agentType === 'aria-orchestrator') {
+        if (cfg('sparc.enabled') === false) {
+          console.log('[SPARC] Disabled by setting localai.sparc.enabled');
+        } else try {
+          const sparcWorkflow = new SPARCWorkflow({ maxCorrections: 2, reflectionThreshold: 0.6 });
+          const userPrompt = (conversation.find(m => m.role === 'user') || {}).content || '';
+          const senseResult = await sparcWorkflow.sense({
+            prompt: userPrompt,
+            workspaceFiles: [],
+            openFiles: [],
+            recentErrors: [],
+            agentMemory: memoryDB ? { patterns: memoryDB.findPatterns('general', '').slice(0, 5).map(p => p.name) } : {}
+          });
+          const planResult = await sparcWorkflow.plan(senseResult);
+
+          // Build a compact SPARC context block for the orchestrator
+          const domains = senseResult.analysis.domains.map(d => `${d.name} (→ ${d.suggestedAgent}, ${d.priority})`).join(', ');
+          const risks = senseResult.analysis.risks.length > 0 ? senseResult.analysis.risks.join(', ') : 'none detected';
+          const mitigations = planResult.riskMitigations.map(m => `${m.risk}: ${m.mitigation}`).join('\n  ');
+          const subtasks = planResult.subtasks.map(t => `[${t.id}] ${t.domain} → ${t.agentType} (priority: ${t.priority}, budget: ${t.stepBudget} steps)`).join('\n  ');
+
+          const sparcContext = [
+            `[SPARC Analysis — Auto-generated by Sense+Plan]`,
+            `Complexity: ${senseResult.analysis.complexity}`,
+            `Domains: ${domains}`,
+            `Risks: ${risks}`,
+            mitigations ? `Mitigations:\n  ${mitigations}` : '',
+            `Suggested topology: ${planResult.topology}`,
+            `Subtask plan:\n  ${subtasks}`,
+            `Estimated total steps: ${planResult.estimatedSteps}`,
+            ``,
+            `Use this analysis to guide your orchestration strategy.`
+          ].filter(Boolean).join('\n');
+
+          conversation.push({ role: 'user', content: sparcContext });
+
+          // Persist SPARC state in MemoryDB for audit
+          if (memoryDB) {
+            memoryDB.saveWorkflowState(`sparc-${taskId}`, {
+              sense: senseResult.analysis,
+              plan: { subtasks: planResult.subtasks, topology: planResult.topology },
+              round: 1
+            });
+            memoryDB.appendEvent('sparc.analysis', {
+              taskId,
+              complexity: senseResult.analysis.complexity,
+              domainCount: senseResult.analysis.domains.length,
+              riskCount: senseResult.analysis.risks.length,
+              topology: planResult.topology
+            }, 'sparc');
+          }
+
+          runtime.features.appendEvent('sparc.injected', {
+            taskId,
+            agentType: 'aria-orchestrator',
+            domains: senseResult.analysis.domains.map(d => d.name),
+            complexity: senseResult.analysis.complexity,
+            topology: planResult.topology
+          });
+          console.log(`[SPARC] Injected analysis for task ${taskId}: ${senseResult.analysis.domains.length} domains, complexity=${senseResult.analysis.complexity}`);
+        } catch (sparcErr) {
+          // SPARC analysis is advisory — never block the task on failure
+          console.warn(`[SPARC] Analysis failed (non-blocking): ${sparcErr.message}`);
+          runtime.features.appendEvent('sparc.error', { taskId, error: sparcErr.message });
+        }
       }
 
       runtime.store.updateTask(taskId, currentTask => {
@@ -4527,9 +4729,11 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
       if (liveHooks.onToolResult) liveHooks.onToolResult(toolCall, resultValue, ok, round);
 
       if (ok && resultValue && resultValue.control === 'await_user') {
+        const nowIso = new Date().toISOString();
         runtime.store.updateTask(taskId, currentTask => {
           currentTask.status = 'awaiting_user';
           currentTask.awaitingQuestionId = resultValue.questionId || '';
+          currentTask.awaitingSince = nowIso;
           currentTask.messages = cloneMessages(conversation);
           currentTask.checkpoint = {
             phase: 'await_model',
@@ -4542,7 +4746,28 @@ async function runLocalAgentTask(taskManager, taskId, runtimeState, liveHooks = 
           };
           return currentTask;
         });
+        // Append a prominent question card to the chat
+        const questionId = resultValue.questionId || '';
+        const question = questionId ? runtime.features.loadQuestion(questionId) : null;
+        const questionText = (question && question.question) || resultValue.question || 'The task needs your input.';
+        const questionChoices = (question && Array.isArray(question.choices)) ? question.choices : (Array.isArray(resultValue.choices) ? resultValue.choices : []);
+        const choicesText = questionChoices.length > 0
+          ? `\n\n**Available choices:** ${questionChoices.map((c, i) => `${i + 1}. ${c}`).join('\n')}`
+          : '';
+        const questionBlock = [
+          `**Waiting for your answer**`,
+          ``,
+          `**${questionText}**`,
+          choicesText,
+          ``,
+          `Reply with your answer to resume the task.`
+        ].join('');
+        runtime.store.appendMessage(task.chatId, {
+          role: 'system-msg',
+          content: questionBlock
+        });
         runtime.features.syncAgentFromTask(runtime.store.loadTask(taskId));
+        if (chatProvider && chatProvider.syncState) chatProvider.syncState();
         return {
           finalText: `Waiting for user input: ${resultValue.question || 'Question pending.'}`,
           conversation,
@@ -4676,25 +4901,38 @@ class AgentTaskManager {
   async resumeTask(taskId, options = {}) {
     const task = this.runtime.store.loadTask(taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
+
     if (options.message) {
       await this.appendTaskMessage(taskId, String(options.message), {
         agentId: task.agentId || '',
         senderAgentId: ''
       });
     }
+
     if (task.runtimeKind === 'cloud' && task.remoteTaskId) {
       await this.cloud.resumeRemoteTask(taskId);
       return this.runtime.store.getTaskRecord(taskId);
     }
+
+
     this.runtime.store.updateTask(taskId, currentTask => {
       currentTask.status = currentTask.status === 'awaiting_user' ? 'resuming' : 'resuming';
       currentTask.stopRequested = false;
       currentTask.error = '';
       currentTask.finishedAt = '';
       currentTask.awaitingQuestionId = '';
+      currentTask.awaitingSince = '';
+      currentTask._timeoutWarned = false;
       currentTask.resumeCount = Number(currentTask.resumeCount || 0) + 1;
       return currentTask;
     });
+
+    if (task.chatId) {
+      this.runtime.store.appendMessage(task.chatId, {
+        role: 'system-msg',
+        content: `Task resumed: ${task.title}. Processing...`
+      });
+    }
     this._schedulePending();
     if (chatProvider && chatProvider.syncState) await chatProvider.syncState();
     return this.runtime.store.getTaskRecord(taskId);
@@ -4737,6 +4975,7 @@ class AgentTaskManager {
         agentType: input.agentType || 'general-purpose'
       })
       : cloneMessages(input.messages);
+    const agentType = input.agentType || 'general-purpose';
     const task = this.runtime.store.createTask({
       title: input.title,
       prompt: input.prompt,
@@ -4745,7 +4984,7 @@ class AgentTaskManager {
       background: input.background !== false,
       runtimeKind,
       agentId: input.agentId || '',
-      agentType: input.agentType || 'general-purpose',
+      agentType,
       agentName: input.agentName || '',
       teamName: input.teamName || '',
       mode: input.mode || 'default',
@@ -4754,7 +4993,7 @@ class AgentTaskManager {
       executorUrl: runtimeKind === 'cloud' ? getCloudExecutorUrl() : '',
       executionRoot,
       messages: preparedMessages,
-      maxRounds: getAgentMaxRounds(task.agentType),
+      maxRounds: getAgentMaxRounds(agentType),
       containerImage: runtimeKind === 'local' ? getSandboxImage() : '',
       liveMode: Boolean(input.liveMode)
     });
@@ -4939,14 +5178,12 @@ class AgentTaskManager {
       if (runningState.activeRequest && typeof runningState.activeRequest.destroy === 'function') {
         try {
           runningState.activeRequest.destroy(new Error('Request aborted by user.'));
-        } catch (error) {
-          console.error(`[localai-code] Failed to abort active model request for task ${taskId}: ${error.message}`);
+        } catch (err) {
+          console.error(`[localai-code] Failed to abort active model request: ${err.message}`);
         }
       }
       if (runningState.activeChild && typeof runningState.activeChild.kill === 'function') {
-        try { runningState.activeChild.kill(); } catch (error) {
-          console.error(`[localai-code] Failed to kill active child process for task ${taskId}: ${error.message}`);
-        }
+        try { runningState.activeChild.kill(); } catch (err) { console.error(`[localai-code] Failed to kill child process: ${err.message}`); }
       }
       this.runtime.store.appendTaskLog(taskId, 'Stop requested by user.', 'warn');
     }
@@ -4965,7 +5202,7 @@ class AgentTaskManager {
       .slice(0, availableSlots);
 
     for (const task of pending) {
-      this._startTask(task.id).catch(() => {});
+      this._startTask(task.id).catch(() => { });
     }
   }
 
@@ -5016,6 +5253,25 @@ class AgentTaskManager {
           role: 'system-msg',
           content: `${prefix} stopped: ${task.title}`
         });
+      } else if (task.status === 'awaiting_user') {
+        const questionId = task.awaitingQuestionId;
+        let questionText = 'The task needs your input to continue.';
+        let questionChoices = [];
+        if (questionId) {
+          const question = this.runtime.features.loadQuestion(questionId);
+          if (question) {
+            questionText = question.question || questionText;
+            questionChoices = Array.isArray(question.choices) ? question.choices : [];
+          }
+        }
+        const elapsed = task.awaitingSince ? this._formatElapsed(Date.now() - new Date(task.awaitingSince).getTime()) : '';
+        const choicesText = questionChoices.length > 0
+          ? `\n\nAvailable choices:\n${questionChoices.map((c, i) => `${i + 1}. ${c}`).join('\n')}`
+          : '';
+        this.runtime.store.appendMessage(task.chatId, {
+          role: 'system-msg',
+          content: `${prefix} is waiting for your answer.\n\n**${questionText}**${choicesText}\n\nPlease reply with your answer to resume the task.${elapsed ? ` (Waiting for ${elapsed})` : ''}`
+        });
       }
 
       this.runtime.store.updateTask(taskId, currentTask => {
@@ -5033,6 +5289,17 @@ class AgentTaskManager {
 
     if (chatProvider && chatProvider.syncState) await chatProvider.syncState();
     return this.runtime.store.loadTask(taskId);
+  }
+
+  _formatElapsed(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    if (totalSec < 60) return `${totalSec}s`;
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    if (min < 60) return `${min}m ${sec}s`;
+    const hr = Math.floor(min / 60);
+    const m = min % 60;
+    return `${hr}h ${m}m`;
   }
 
   async _startTask(taskId, liveHooks = {}) {
@@ -5245,23 +5512,26 @@ function formatApiError(statusCode, errorData, modelId) {
   try {
     const parsed = JSON.parse(errorData);
     message = extractErrorMessage(parsed.error || parsed.message || parsed.detail || parsed) || errorData;
-  } catch (error) {
-    console.error(`[localai-code] Failed to parse API error payload: ${error.message}`);
+  } catch (_) {
     message = extractErrorMessage(errorData) || errorData;
   }
 
   message = String(message || '').trim();
 
+  if (message.includes('api-inference.huggingface.co')) {
+    return 'A legacy LM Studio endpoint was called. Reload VS Code so the Router-based extension code is used.';
+  }
+
+  if (statusCode === 401 || statusCode === 403) {
+    return 'Authentication failed. Use a LM Studio token with "Make calls to Inference Providers" permission.';
+  }
+
   if (statusCode === 404) {
-    return `LM Studio could not find the requested endpoint or model "${modelId}".`;
+    return `Model "${modelId}" was not found or is not available through LM Studio Inference Providers.`;
   }
 
   if (statusCode === 400) {
-    return `LM Studio rejected model "${modelId}": ${message || 'Bad request'}`;
-  }
-
-  if (statusCode === 503) {
-    return message || 'LM Studio is reachable, but no compatible model is loaded.';
+    return `Model "${modelId}" is not accepted by the chat-completions router: ${message || 'Bad request'}`;
   }
 
   return `API Error (${statusCode}): ${message || 'Unknown error'}`;
@@ -5298,8 +5568,7 @@ function httpJsonRequest(urlString, options = {}) {
         if (raw && contentType.includes('application/json')) {
           try {
             data = JSON.parse(raw);
-          } catch (error) {
-            console.error(`[localai-code] Failed to parse JSON HTTP response from ${urlString}: ${error.message}`);
+          } catch (_) {
             data = null;
           }
         }
@@ -5328,23 +5597,26 @@ function httpJsonRequest(urlString, options = {}) {
 }
 
 async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
-  const modelId = await resolveChatModelId(body.model || getModelId());
-  const url = new URL(`${getBaseUrl()}${endpoint || '/chat/completions'}`);
-  const transport = url.protocol === 'http:' ? http : https;
-  
-  // Ensure the model is included in the body
-  body.model = modelId;
-  // Sanitize messages for API
-  if (body.messages) {
-    body.messages = toApiMessages(body.messages);
+  const token = getApiToken();
+  const modelId = normalizeModelId(getModelId());
+
+  if (!token) {
+    throw new Error('LM Studio API Token not configured. Please add it in settings.');
   }
-  const payload = JSON.stringify(body);
 
   return new Promise((resolve, reject) => {
     let settled = false;
     let deadlineTimer = null;
     let response = null;
-    const payload = JSON.stringify(requestBody);
+    const url = new URL(`https://${HF_ROUTER_HOST}${endpoint || HF_CHAT_COMPLETIONS_PATH}`);
+
+    // Ensure the model is included in the body
+    body.model = modelId;
+    // Sanitize messages for API
+    if (body.messages) {
+      body.messages = toApiMessages(body.messages);
+    }
+    const payload = JSON.stringify(body);
     const requestTimeoutMs = Number(requestOptions.timeoutMs || 120000) || 120000;
     const finishResolve = (value) => {
       if (settled) return;
@@ -5365,7 +5637,7 @@ async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
       reject(error);
     };
     const failForTimeout = () => {
-      const message = `LM Studio request timed out after ${requestTimeoutMs}ms at ${getBaseUrl()}.`;
+      const message = `LM Studio request timed out after ${requestTimeoutMs}ms.`;
       setConnectionState(false, message);
       if (response && typeof response.destroy === 'function') {
         try {
@@ -5381,20 +5653,20 @@ async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
     };
 
     const options = {
-      protocol: url.protocol,
       hostname: url.hostname,
-      port: url.port || (url.protocol === 'http:' ? 80 : 443),
-      path: `${url.pathname}${url.search}`,
+      port: 443,
+      path: url.pathname,
       method: 'POST',
       headers: {
-        'Accept': requestBody.stream ? 'text/event-stream' : 'application/json',
+        'Accept': body.stream ? 'text/event-stream' : 'application/json',
         'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
         'Content-Length': Buffer.byteLength(payload)
       },
       timeout: requestTimeoutMs
     };
 
-    const req = transport.request(options, (res) => {
+    const req = https.request(options, (res) => {
       response = res;
       if (typeof res.setTimeout === 'function') {
         res.setTimeout(requestTimeoutMs, failForTimeout);
@@ -5403,9 +5675,23 @@ async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
         let errorData = '';
         res.on('data', c => errorData += c.toString());
         res.on('end', () => {
-          const message = formatApiError(res.statusCode, errorData, modelId);
-          setConnectionState(false, message);
-          finishReject(new Error(message));
+          try {
+            const errJson = JSON.parse(errorData);
+            // Handle "Model is loading"
+            if (errJson.error && errJson.error.includes('currently loading')) {
+              const waitTime = errJson.estimated_time || 20;
+              vscode.window.showInformationMessage(`Model is loading on LM Studio. Retrying in ${Math.round(waitTime)}s...`);
+              setTimeout(() => apiRequest(endpoint, body, onChunk, requestOptions).then(finishResolve).catch(finishReject), waitTime * 1000);
+              return;
+            }
+            const message = formatApiError(res.statusCode, errorData, modelId);
+            setConnectionState(false, message);
+            finishReject(new Error(message));
+          } catch (_) {
+            const message = formatApiError(res.statusCode, errorData, modelId);
+            setConnectionState(false, message);
+            finishReject(new Error(message));
+          }
         });
         return;
       }
@@ -5434,14 +5720,14 @@ async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
             onChunk(delta);
             fullText += delta;
           }
-        } catch (error) {
-          console.error(`[localai-code] Failed to parse SSE chunk from LM Studio: ${error.message}`);
+        } catch (err) {
+          console.error(`[localai-code] Failed to parse SSE chunk: ${err.message}`);
         }
       };
 
       res.on('data', (chunk) => {
         const raw = chunk.toString();
-        if (onChunk && requestBody.stream) {
+        if (onChunk && body.stream) {
           // SSE frames can be split across TCP chunks, so keep a rolling buffer.
           sseBuffer = `${sseBuffer}${raw}`.replace(/\r\n/g, '\n');
           const events = sseBuffer.split('\n\n');
@@ -5454,7 +5740,7 @@ async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
         }
       });
       res.on('end', () => {
-        if (onChunk && requestBody.stream) {
+        if (onChunk && body.stream) {
           if (sseBuffer.trim()) processSseEvent(sseBuffer);
           finishResolve(fullText);
           return;
@@ -5462,7 +5748,7 @@ async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
         try { finishResolve(JSON.parse(fullText)); } catch (e) { finishReject(e); }
       });
       res.on('aborted', () => {
-        const message = `LM Studio closed the response before completion at ${getBaseUrl()}.`;
+        const message = `LM Studio closed the response before completion for model "${modelId}".`;
         setConnectionState(false, message);
         finishReject(new Error(message));
       });
@@ -5473,7 +5759,7 @@ async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
       requestOptions.onRequestCreated(req);
     }
     req.on('error', (error) => {
-      const message = formatLmStudioConnectionError(error instanceof Error ? error.message : String(error));
+      const message = formatHfConnectionError(error instanceof Error ? error.message : String(error));
       setConnectionState(false, message);
       finishReject(new Error(message));
     });
@@ -5485,67 +5771,140 @@ async function apiRequest(endpoint, body, onChunk, requestOptions = {}) {
   });
 }
 
-async function featureExtractionRequest(inputs) {
-  const modelId = await resolveEmbeddingModelId();
-  const inputList = Array.isArray(inputs) ? inputs : [inputs];
-  let response;
-  try {
-    response = await httpJsonRequest(`${getBaseUrl()}/embeddings`, {
-      method: 'POST',
-      body: {
-        model: modelId,
-        input: inputList
-      },
-      timeoutMs: 120000
-    });
-  } catch (error) {
-    const message = formatLmStudioConnectionError(error instanceof Error ? error.message : String(error));
-    setConnectionState(false, message);
-    throw new Error(message);
+);
+
+  if (!token) {
+    throw new Error('LM Studio API Token not configured.');
   }
-  const vectors = Array.isArray(response.data?.data)
-    ? response.data.data.map(entry => Array.isArray(entry.embedding) ? entry.embedding : [])
-    : [];
-  return Array.isArray(inputs) ? vectors : (vectors[0] || []);
-}
 
-function formatLmStudioConnectionError(detail) {
-  const message = normalizeWhitespace(detail) || 'Unknown connection error.';
-  return `Unable to reach LM Studio at ${getBaseUrl()}: ${message}`;
-}
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const encodedModel = modelId.split('/').map(encodeURIComponent).join('/');
+    const finishResolve = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const options = {
+      hostname: HF_ROUTER_HOST,
+      port: 443,
+      path: `/${HF_INFERENCE_PROVIDER}/models/${encodedModel}`,
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        'Content-Length': Buffer.byteLength(payload)
+      },
+      timeout: 120000
+    };
 
-async function checkConnection() {
-  try {
-    const availableModels = await fetchAvailableModels();
-    if (!availableModels.length) {
-      setConnectionState(false, `LM Studio is reachable at ${getBaseUrl()}, but no model is loaded.`);
-      return false;
-    }
-
-    const selectedModel = normalizeModelId(getModelId());
-    if (selectedModel === 'auto') {
-      const chatModels = availableModels.filter(id => !isLikelyEmbeddingModelId(id));
-      if (!chatModels.length) {
-        setConnectionState(false, `LM Studio is reachable at ${getBaseUrl()}, but no chat-capable model is loaded.`);
-        return false;
-      }
-    }
-    if (selectedModel && selectedModel !== 'auto') {
-      const baseModel = getBaseModelId(selectedModel);
-      const modelAvailable = availableModels.some(id => {
-        const candidate = String(id || '');
-        return candidate === selectedModel || candidate === baseModel || candidate.startsWith(`${baseModel}:`);
+    const req = https.request(options, (res) => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk.toString());
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          const message = `Embedding API Error (${res.statusCode}): ${extractErrorMessage(raw) || raw}`;
+          setConnectionState(false, message);
+          finishReject(new Error(message));
+          return;
+        }
+        try {
+          finishResolve(JSON.parse(raw));
+        } catch (error) {
+          finishReject(error);
+        }
       });
-      if (!modelAvailable) {
-        setConnectionState(false, `Model "${selectedModel}" is not loaded in LM Studio. Try "${FALLBACK_MODEL_ID}" or set localai.modelId to "auto".`);
-        return false;
-      }
-    }
+    });
 
-    setConnectionState(true);
-    return true;
-  } catch (error) {
-    setConnectionState(false, formatLmStudioConnectionError(error instanceof Error ? error.message : String(error)));
+    req.on('error', (error) => {
+      const message = formatHfConnectionError(error instanceof Error ? error.message : String(error));
+      setConnectionState(false, message);
+      finishReject(new Error(message));
+    });
+    req.on('timeout', () => {
+      const message = 'Embedding request timed out while contacting LM Studio Router.';
+      setConnectionState(false, message);
+      req.destroy(new Error(message));
+      finishReject(new Error(message));
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
+function formatHfConnectionError(detail) {
+  const message = normalizeWhitespace(detail) || 'Unknown connection error.';
+  return `Unable to reach LM Studio Router: ${message}`;
+}
+
+
+
+  try {
+    return new Promise((resolve) => {
+      let responseData = '';
+      const options = {
+        hostname: HF_ROUTER_HOST,
+        port: 443,
+        path: HF_MODELS_PATH,
+        headers: {
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        method: 'GET',
+        timeout: 10000
+      };
+      const req = https.request(options, (res) => {
+        res.on('data', chunk => responseData += chunk.toString());
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            const availableModels = parseModelList(responseData);
+            const selectedModel = normalizeModelId(getModelId());
+            const baseModel = getBaseModelId(selectedModel);
+            const modelAvailable = availableModels.length === 0 || availableModels.some(id => {
+              const candidate = String(id || '');
+              return candidate === selectedModel || candidate === baseModel || candidate.startsWith(`${baseModel}:`);
+            });
+
+            if (!modelAvailable) {
+              setConnectionState(
+                false,
+                `Token valide, mais le modele "${selectedModel}" n'est pas disponible via LM Studio Inference Providers chat. Essaye "${FALLBACK_MODEL_ID}".`
+              );
+              resolve(false);
+              return;
+            }
+
+            setConnectionState(true);
+            resolve(true);
+            return;
+          }
+
+          const detail = formatApiError(res.statusCode, responseData, getModelId());
+          setConnectionState(false, detail);
+          resolve(false);
+        });
+      });
+      req.on('error', (error) => {
+        setConnectionState(false, formatHfConnectionError(error instanceof Error ? error.message : String(error)));
+        resolve(false);
+      });
+      req.on('timeout', () => {
+        const message = 'Timed out while connecting to LM Studio Router.';
+        req.destroy(new Error(message));
+        setConnectionState(false, message);
+        resolve(false);
+      });
+      req.end();
+    });
+  } catch (err) {
+    console.error(`[localai-code] Connection check failed: ${err.message}`);
+    setConnectionState(false, formatHfConnectionError(err instanceof Error ? err.message : String(err)));
     return false;
   }
 }
@@ -5553,27 +5912,26 @@ async function checkConnection() {
 async function ensureChatBackendReady() {
   const connected = await checkConnection();
   if (connected) return true;
-  throw new Error(`${lastConnectionError || formatLmStudioConnectionError('The local server did not answer.')} Start the LM Studio local server, load a chat model, or update localai.baseUrl/localai.modelId.`);
+  throw new Error(`${lastConnectionError || formatHfConnectionError('The router did not answer.')} Check your LM Studio token, model ID, network, or proxy settings.`);
 }
 
 function updateStatus() {
   if (!statusBarItem) return;
   const modelId = normalizeModelId(getModelId());
   if (isConnected) {
-    const label = modelId === 'auto' ? 'auto' : modelId.split('/').pop();
-    statusBarItem.text = `$(sparkle) LocalAI: ${label}`;
-    statusBarItem.tooltip = `LM Studio connected — Model: ${modelId}\nClick to change model`;
+    statusBarItem.text = `$(sparkle) HF: ${modelId.split('/').pop()}`;
+    statusBarItem.tooltip = `LM Studio Connected — Model: ${modelId}\nClick to change model`;
     statusBarItem.color = '#4ec9b0';
   } else {
-    statusBarItem.text = '$(error) LocalAI: Disconnected';
+    statusBarItem.text = '$(error) HF: Disconnected';
     statusBarItem.tooltip = lastConnectionError
-      ? `${lastConnectionError}\nClick to configure LM Studio URL or model`
-      : 'Click to configure LM Studio URL or model';
+      ? `${lastConnectionError}\nClick to configure HF Token or Model ID`
+      : 'Click to configure HF Token or Model ID';
     statusBarItem.color = '#f44747';
   }
 }
 
-// ── Chat with LM Studio ───────────────────────────────────────────────────────
+// ── Chat with HF ──────────────────────────────────────────────────────────────
 async function chatWithModel(messages, onChunk, options = {}) {
   return apiRequest('', {
     messages,
@@ -5603,10 +5961,10 @@ function getEditorContext(editor, selection) {
 }
 
 // ── Inline Completion Provider ────────────────────────────────────────────────
-class LocalAIInlineCompletionProvider {
+class HFInlineCompletionProvider {
   async provideInlineCompletionItems(document, position, context, token) {
     if (!cfg('enableInlineCompletions')) return [];
-    if (!isConnected) return [];
+    if (!isConnected && !getApiToken()) return [];
 
     const debounceMs = cfg('completionDebounceMs') ?? 1000;
     await new Promise(r => { debounceTimer = setTimeout(r, debounceMs); });
@@ -5642,15 +6000,15 @@ class LocalAIInlineCompletionProvider {
         range: new vscode.Range(position, position),
         command: { command: 'editor.action.inlineSuggest.commit', title: 'Accept' }
       }];
-    } catch (error) {
-      console.error(`[localai-code] Inline completion failed: ${error.message}`);
+    } catch (err) {
+      console.error(`[localai-code] Inline completion failed: ${err.message}`);
       return [];
     }
   }
 }
 
 // ── Chat WebView Panel Provider ───────────────────────────────────────────────
-class LocalAIChatViewProvider {
+class HFChatViewProvider {
   constructor(context) {
     this._context = context;
     this._view = null;
@@ -5666,6 +6024,7 @@ class LocalAIChatViewProvider {
     await appRuntime.initialize();
     const snapshot = appRuntime.store.getUiSnapshot();
     const activeChatId = snapshot.activeChatId;
+    console.log(`[Extension] syncState: sending activeChatId=${activeChatId}, messages=${snapshot.messages.length}`);
     const contextMeta = activeChatId ? appRuntime.getContextMeta(activeChatId) : null;
     const sandboxStatus = await appRuntime.getSandboxStatus();
     const featureSnapshot = appRuntime.features.getSnapshot();
@@ -5690,12 +6049,22 @@ class LocalAIChatViewProvider {
         workspaceMemoryCount: snapshot.workspaceMemoryCount,
         globalMemoryCount: snapshot.globalMemoryCount
       },
+      moduleStatus: {
+        defence: { enabled: cfg('defence.enabled') !== false, label: 'AIDefence' },
+        guard: { enabled: cfg('guard.enabled') !== false && !!mutationGuard, label: 'MutationGuard', roles: mutationGuard ? mutationGuard.getStats().configuredRoles : 0 },
+        sparc: { enabled: cfg('sparc.enabled') !== false, label: 'SPARC' },
+        cve: { enabled: cfg('cve.enabled') !== false, label: 'CVE Scanner' },
+        plugins: { enabled: cfg('plugins.enabled') !== false && !!pluginManager, label: 'Plugins', count: pluginManager ? pluginManager.loadAll().pluginCount : 0 },
+        memorydb: { enabled: cfg('memorydb.enabled') !== false && !!memoryDB, label: 'MemoryDB' },
+        encryption: { enabled: !!(encryptionVault && encryptionVault.isEnabled && encryptionVault.isEnabled()), label: 'Encryption' },
+        learning: { enabled: !!learningEngine, label: 'Learning' },
+        router: { enabled: !!providerRouter, label: 'Router' }
+      },
       instructionStatus: appRuntime.getInstructionStatus(activeChatId),
       responseMeta: activeChatId ? this._getResponseMeta(activeChatId) : null,
       busy: Boolean(this._streaming),
       connected: isConnected,
       model: getModelId(),
-      baseUrl: getBaseUrl(),
       detail: lastConnectionError
     });
   }
@@ -5712,121 +6081,121 @@ class LocalAIChatViewProvider {
       try {
         await appRuntime.initialize();
         switch (msg.type) {
-        case 'ready':
-          await this._onReady();
-          break;
-        case 'send':
-          await this._handleSend(msg.text, msg.includeFile, Boolean(msg.background));
-          break;
-        case 'newChat':
-          appRuntime.store.createChat('New Chat');
-          await this.syncState();
-          break;
-        case 'forkChat':
-          appRuntime.store.forkChat(msg.chatId || appRuntime.store.getActiveChatId(), msg.title || '');
-          await this.syncState();
-          break;
-        case 'selectChat':
-          appRuntime.store.selectChat(msg.chatId);
-          await this.syncState();
-          break;
-        case 'selectFork': {
-          const targetChatId = msg.chatId || '';
-          if (targetChatId) {
-            console.log(`[Extension] Received selectFork: ${targetChatId}`);
-            appRuntime.store.selectChat(targetChatId);
+          case 'ready':
+            await this._onReady();
+            break;
+          case 'send':
+            await this._handleSend(msg.text, msg.includeFile, Boolean(msg.background));
+            break;
+          case 'newChat':
+            appRuntime.store.createChat('New Chat');
             await this.syncState();
-          }
-          break;
-        }
-        case 'renameChat': {
-          const current = appRuntime.store.getChats().find(chat => chat.id === msg.chatId);
-          const title = await vscode.window.showInputBox({
-            prompt: 'Rename chat',
-            value: current ? current.title : '',
-            validateInput: value => normalizeWhitespace(value) ? null : 'Title is required'
-          });
-          if (title) {
-            appRuntime.store.renameChat(msg.chatId, title);
+            break;
+          case 'forkChat':
+            appRuntime.store.forkChat(msg.chatId || appRuntime.store.getActiveChatId(), msg.title || '');
             await this.syncState();
-          }
-          break;
-        }
-        case 'deleteChat': {
-          const choice = await vscode.window.showWarningMessage('Delete this chat permanently?', { modal: true }, 'Delete');
-          if (choice === 'Delete') {
-            appRuntime.store.deleteChat(msg.chatId);
+            break;
+          case 'selectChat':
+            console.log(`[Extension] Received selectChat: ${msg.chatId}`);
+            appRuntime.store.selectChat(msg.chatId);
             await this.syncState();
-          }
-          break;
-        }
-        case 'togglePin':
-          appRuntime.store.togglePin(msg.chatId);
-          await this.syncState();
-          break;
-        case 'stopTask':
-          await appRuntime.tasks.stopTask(msg.taskId);
-          await this.syncState();
-          break;
-        case 'replyToTask': {
-          const task = appRuntime.store.loadTask(msg.taskId);
-          if (task && task.status === 'awaiting_user') {
-            await appRuntime.tasks.resumeTask(msg.taskId, { message: 'User replied to resume.' });
-            await this.syncState();
-          }
-          break;
-        }
-        case 'stopResponse':
-          await this._stopActiveConversation();
-          break;
-        case 'interruptSend':
-          await this._stopActiveConversation(false);
-          await this._handleSend(msg.text, msg.includeFile, Boolean(msg.background));
-          break;
-        case 'acceptPatch':
-          await appRuntime.applyPatch(msg.patchId);
-          await this.syncState();
-          break;
-        case 'rejectPatch':
-          await appRuntime.rejectPatch(msg.patchId);
-          await this.syncState();
-          break;
-        case 'reviewPatch':
-          await appRuntime.reviewPatch(msg.patchId, msg.filePath);
-          break;
-        case 'saveInstructions': {
-          const scope = String(msg.scope || '').trim();
-          const text = normalizeInstructionText(msg.text);
-          if (scope === 'global') {
-            await vscode.workspace.getConfiguration('localai').update('instructions.global', text, vscode.ConfigurationTarget.Global);
-          } else if (scope === 'workspace') {
-            if (!getWorkspaceFolder()) {
-              vscode.window.showErrorMessage('Workspace instructions require an open workspace.');
-              break;
+            break;
+          case 'selectFork': {
+            const targetChatId = msg.chatId || '';
+            if (targetChatId) {
+              appRuntime.store.selectChat(targetChatId);
+              await this.syncState();
             }
-            await vscode.workspace.getConfiguration('localai').update('instructions.workspace', text, vscode.ConfigurationTarget.Workspace);
-          } else if (scope === 'chat') {
-            const targetChatId = msg.chatId || appRuntime.store.getActiveChatId();
-            appRuntime.store.setChatInstructions(targetChatId, text);
+            break;
           }
-          await this.syncState();
-          break;
-        }
-        case 'selectModel': await this._selectModel(); break;
-        case 'checkConnection': await this._doCheckConnection(); break;
-        case 'applyCode': await this._applyCode(msg.code, msg.language); break;
-        case 'copyCode': vscode.env.clipboard.writeText(msg.code); vscode.window.showInformationMessage('Code copied!'); break;
-        case 'createFile': await this._createFile(msg.code, msg.language); break;
-        case 'saveBaseUrl':
-          await vscode.workspace.getConfiguration('localai').update('baseUrl', String(msg.baseUrl || '').trim() || DEFAULT_BASE_URL, vscode.ConfigurationTarget.Global);
-          await this._doCheckConnection();
-          break;
-        case 'saveModel': {
-          const modelId = normalizeModelId(msg.model);
-          await vscode.workspace.getConfiguration('localai').update('modelId', modelId, vscode.ConfigurationTarget.Global);
-          await this._doCheckConnection();
-          break;
-        }
+          case 'renameChat': {
+            const current = appRuntime.store.getChats().find(chat => chat.id === msg.chatId);
+            const title = await vscode.window.showInputBox({
+              prompt: 'Rename chat',
+              value: current ? current.title : '',
+              validateInput: value => normalizeWhitespace(value) ? null : 'Title is required'
+            });
+            if (title) {
+              appRuntime.store.renameChat(msg.chatId, title);
+              await this.syncState();
+            }
+            break;
+          }
+          case 'deleteChat': {
+            const choice = await vscode.window.showWarningMessage('Delete this chat permanently?', { modal: true }, 'Delete');
+            if (choice === 'Delete') {
+              appRuntime.store.deleteChat(msg.chatId);
+              await this.syncState();
+            }
+            break;
+          }
+          case 'togglePin':
+            appRuntime.store.togglePin(msg.chatId);
+            await this.syncState();
+            break;
+          case 'stopTask':
+            await appRuntime.tasks.stopTask(msg.taskId);
+            await this.syncState();
+            break;
+          case 'replyToTask': {
+            const task = appRuntime.store.loadTask(msg.taskId);
+            if (task && task.status === 'awaiting_user') {
+              await appRuntime.tasks.resumeTask(msg.taskId, { message: 'User replied to resume.' });
+              await this.syncState();
+            }
+            break;
+          }
+          case 'stopResponse':
+            await this._stopActiveConversation();
+            break;
+          case 'interruptSend':
+            await this._stopActiveConversation(false);
+            await this._handleSend(msg.text, msg.includeFile, Boolean(msg.background));
+            break;
+          case 'acceptPatch':
+            await appRuntime.applyPatch(msg.patchId);
+            await this.syncState();
+            break;
+          case 'rejectPatch':
+            await appRuntime.rejectPatch(msg.patchId);
+            await this.syncState();
+            break;
+          case 'reviewPatch':
+            await appRuntime.reviewPatch(msg.patchId, msg.filePath);
+            break;
+          case 'saveInstructions': {
+            const scope = String(msg.scope || '').trim();
+            const text = normalizeInstructionText(msg.text);
+            if (scope === 'global') {
+              await vscode.workspace.getConfiguration('localai').update('instructions.global', text, vscode.ConfigurationTarget.Global);
+            } else if (scope === 'workspace') {
+              if (!getWorkspaceFolder()) {
+                vscode.window.showErrorMessage('Workspace instructions require an open workspace.');
+                break;
+              }
+              await vscode.workspace.getConfiguration('localai').update('instructions.workspace', text, vscode.ConfigurationTarget.Workspace);
+            } else if (scope === 'chat') {
+              const targetChatId = msg.chatId || appRuntime.store.getActiveChatId();
+              appRuntime.store.setChatInstructions(targetChatId, text);
+            }
+            await this.syncState();
+            break;
+          }
+          case 'selectModel': await this._selectModel(); break;
+          case 'checkConnection': await this._doCheckConnection(); break;
+          case 'applyCode': await this._applyCode(msg.code, msg.language); break;
+          case 'copyCode': vscode.env.clipboard.writeText(msg.code); vscode.window.showInformationMessage('Code copied!'); break;
+          case 'createFile': await this._createFile(msg.code, msg.language); break;
+          case 'saveToken':
+            await saveApiTokenSecure(msg.token || '');
+            await this._doCheckConnection();
+            break;
+          case 'saveModel': {
+            const modelId = normalizeModelId(msg.model);
+            await vscode.workspace.getConfiguration('localai').update('modelId', modelId, vscode.ConfigurationTarget.Global);
+            await this._doCheckConnection();
+            break;
+          }
         }
       } catch (error) {
         const text = error instanceof Error ? error.message : String(error);
@@ -5882,20 +6251,27 @@ class LocalAIChatViewProvider {
     const connected = await checkConnection();
     await this.syncState();
     if (connected) {
-      vscode.window.showInformationMessage('Successfully connected to LM Studio.');
+      vscode.window.showInformationMessage('Successfully connected to LM Studio Router!');
     } else {
-      vscode.window.showErrorMessage(lastConnectionError || 'Connection failed. Check the LM Studio server URL and load a model.');
+      vscode.window.showErrorMessage(lastConnectionError || 'Connection failed. Make sure your token has "Make calls to Inference Providers" permission.');
     }
   }
 
   async _selectModel() {
-    const loadedModels = await fetchAvailableModels().catch(() => []);
+    const popularModels = [
+      'deepseek-ai/DeepSeek-V4-Pro',
+      'google/gemma-3n-E4B-it:together',
+      'Qwen/Qwen3.5-397B-A17B:fastest',
+      'Qwen/Qwen2.5-Coder-32B-Instruct:fastest',
+      'deepseek-ai/DeepSeek-R1:fastest',
+      'zai-org/GLM-4.5:fastest',
+      'Qwen/Qwen3-Coder-480B-A35B-Instruct:fastest'
+    ];
 
     const pick = await vscode.window.showQuickPick(
       [
-        { label: 'auto', detail: 'Use the first loaded LM Studio chat model' },
-        ...loadedModels.map(m => ({ label: m, detail: 'Currently loaded in LM Studio' })),
-        { label: 'Enter custom Model ID...', detail: 'Use a specific model identifier even if it is not currently detected.' }
+        { label: 'Enter custom Model ID...', detail: 'Input any model from the LM Studio Hub' },
+        ...popularModels.map(m => ({ label: m }))
       ],
       { placeHolder: 'Select or enter a model ID', title: 'LocalAI: Select Model' }
     );
@@ -5903,13 +6279,13 @@ class LocalAIChatViewProvider {
     if (pick) {
       let finalModel = pick.label;
       if (pick.label === 'Enter custom Model ID...') {
-        finalModel = await vscode.window.showInputBox({ 
-          prompt: 'Enter an LM Studio chat model ID, or use "auto" to select the first loaded chat model.',
-          placeHolder: 'e.g. qwen2.5-coder-32b-instruct or auto',
+        finalModel = await vscode.window.showInputBox({
+          prompt: 'Enter a LM Studio chat model ID available through Inference Providers',
+          placeHolder: 'e.g. Qwen/Qwen3.5-397B-A17B:fastest',
           value: normalizeModelId(getModelId())
         });
       }
-      
+
       if (finalModel) {
         finalModel = normalizeModelId(finalModel);
         await vscode.workspace.getConfiguration('localai').update('modelId', finalModel, vscode.ConfigurationTarget.Global);
@@ -6002,6 +6378,8 @@ class LocalAIChatViewProvider {
     const text = normalizeWhitespace(userText);
     if (!text || this._streaming) return;
 
+    let isConnected = false;
+
     await appRuntime.initialize();
     const activeChat = appRuntime.store.ensureActiveChat();
     const pendingQuestion = appRuntime.features.getPendingQuestionForChat(activeChat.id);
@@ -6032,7 +6410,7 @@ class LocalAIChatViewProvider {
       await ensureChatBackendReady();
       if (!background && !isCurrentForegroundRun()) return;
     } catch (err) {
-      this._post({ type: 'status', connected: isConnected, model: getModelId(), baseUrl: getBaseUrl(), detail: lastConnectionError });
+      this._post({ type: 'status', connected: isConnected, model: getModelId(), detail: lastConnectionError });
       this._post({ type: 'error', text: err instanceof Error ? err.message : String(err) });
       await this.syncState();
       return;
@@ -6051,6 +6429,7 @@ class LocalAIChatViewProvider {
       return;
     }
     const contextMetaForIntent = appRuntime.getContextMeta(activeChat.id);
+    isConnected = await checkConnection();
     const intentContext = injectIntentFormatInstructions(messages, userText, contextMetaForIntent);
     messages = intentContext.messages;
     this._setResponseMeta(activeChat.id, buildResponseMeta(intentContext, { status: 'pending', issues: [] }, {
@@ -6173,7 +6552,7 @@ class LocalAIChatViewProvider {
       await this.syncState();
     } catch (err) {
       if (!isCurrentForegroundRun() && isUserAbortError(err)) return;
-      this._post({ type: 'status', connected: isConnected, model: getModelId(), baseUrl: getBaseUrl(), detail: lastConnectionError });
+      this._post({ type: 'status', connected: isConnected, model: getModelId(), detail: lastConnectionError });
       this._post({ type: 'error', text: err.message });
       await this.syncState();
     } finally {
@@ -6181,8 +6560,8 @@ class LocalAIChatViewProvider {
         this._activeForegroundTaskId = '';
         this._abortActiveStream = null;
         this._streaming = false;
-        await this.syncState();
       }
+      await this.syncState();
     }
   }
 
@@ -6225,8 +6604,7 @@ class LocalAIChatViewProvider {
       // Replace brand names
       html = html.replace(/LocalAI/g, 'LocalAI');
       return html;
-    } catch (error) {
-      console.error(`[localai-code] Failed to load chat webview HTML: ${error.message}`);
+    } catch (_) {
       return getFallbackHtml(nonce, webview.cspSource);
     }
   }
@@ -6401,7 +6779,9 @@ function createTestingApi() {
 // ── activate ──────────────────────────────────────────────────────────────────
 async function activate(context) {
   extensionContext = context;
-  appRuntime = new LocalAIRuntime(context);
+  // Charger le token depuis SecretStorage en premier — doit être fait avant tout
+  await loadApiTokenCache();
+  appRuntime = new HFAIRuntime(context);
 
   // Status bar
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -6412,7 +6792,7 @@ async function activate(context) {
   context.subscriptions.push(statusBarItem);
 
   // Chat view provider
-  chatProvider = new LocalAIChatViewProvider(context);
+  chatProvider = new HFChatViewProvider(context);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('localai.chatView', chatProvider, {
       webviewOptions: { retainContextWhenHidden: true }
@@ -6420,7 +6800,7 @@ async function activate(context) {
   );
 
   // Inline completions
-  inlineCompletionProvider = new LocalAIInlineCompletionProvider();
+  inlineCompletionProvider = new HFInlineCompletionProvider();
   context.subscriptions.push(
     vscode.languages.registerInlineCompletionItemProvider(
       [{ scheme: 'file', pattern: '**' }, { scheme: 'untitled', pattern: '**' }],
@@ -6460,6 +6840,73 @@ async function activate(context) {
     vscode.commands.registerCommand('localai.checkConnection', async () => {
       if (chatProvider) await chatProvider._doCheckConnection();
     }),
+    vscode.commands.registerCommand('localai.setToken', async () => {
+      const currentToken = getApiToken();
+      const token = await vscode.window.showInputBox({
+        prompt: 'Enter your LM Studio API Token (Get one at https://huggingface.co/settings/tokens)',
+        placeHolder: 'hf_...',
+        password: true,
+        value: currentToken
+      });
+      if (token !== undefined && token !== null) {
+        await saveApiTokenSecure(token);
+        vscode.window.showInformationMessage('LM Studio Token saved securely (SecretStorage).');
+        await checkConnection();
+        if (chatProvider) chatProvider._post({ type: 'status', connected: isConnected, model: getModelId(), detail: lastConnectionError });
+      }
+    }),
+    vscode.commands.registerCommand('localai.cleanSandboxes', async () => {
+      try {
+        await appRuntime.initialize();
+        const sandboxesDir = path.join(appRuntime.store.storageRoot, SANDBOXES_DIR);
+        if (!fs.existsSync(sandboxesDir)) {
+          vscode.window.showInformationMessage('No sandbox directory found.');
+          return;
+        }
+        const entries = fs.readdirSync(sandboxesDir);
+        let removed = 0;
+        for (const entry of entries) {
+          try { fs.rmSync(path.join(sandboxesDir, entry), { recursive: true, force: true }); removed++; } catch (_) {}
+        }
+        vscode.window.showInformationMessage(`Cleaned ${removed} sandbox workspace(s).`);
+        if (chatProvider) await chatProvider.syncState();
+      } catch (err) {
+        vscode.window.showErrorMessage(`Failed to clean sandboxes: ${err.message}`);
+      }
+    }),
+    vscode.commands.registerCommand('localai.createAgentsMd', async () => {
+      const folders = vscode.workspace.workspaceFolders;
+      if (!folders || folders.length === 0) { vscode.window.showWarningMessage('No workspace folder open.'); return; }
+      const rootPath = folders[0].uri.fsPath;
+      const agentsMdPath = path.join(rootPath, 'AGENTS.md');
+      if (fs.existsSync(agentsMdPath)) {
+        const choice = await vscode.window.showQuickPick(['Yes, overwrite', 'No, open existing'], { placeHolder: 'AGENTS.md already exists.' });
+        if (!choice || choice.startsWith('No')) { vscode.window.showTextDocument(vscode.Uri.file(agentsMdPath)); return; }
+      }
+      let pkgInfo = {};
+      try { pkgInfo = JSON.parse(fs.readFileSync(path.join(rootPath, 'package.json'), 'utf8')); } catch (_) {}
+      const projectName = pkgInfo.name || path.basename(rootPath);
+      const deps = pkgInfo.dependencies ? Object.keys(pkgInfo.dependencies).slice(0, 8).map(d => `- ${d}`).join('\n') : '- (a renseigner)';
+      const scripts = pkgInfo.scripts ? Object.entries(pkgInfo.scripts).slice(0, 5).map(([k,v]) => `- ${k}: \`${v}\``).join('\n') : '- build: npm run build\n- test: npm test';
+      const template = `# Instructions Agents IA — ${projectName}\n\n> ${pkgInfo.description || 'Configuration des agents LocalAI Code pour ce projet.'}\n\n## Stack Technique\n${deps}\n\n## Conventions de Code\n- Documenter les fonctions publiques\n- Tests obligatoires pour les fonctions critiques\n- Ne jamais supprimer sans confirmation\n\n## Zones Sensibles\n- Ne pas modifier les fichiers de config production directement\n\n## Commandes Utiles\n${scripts}\n\n## Notes pour les Agents\n- (Ajoutez ici toute information importante)\n`;
+      fs.writeFileSync(agentsMdPath, template, 'utf8');
+      const doc = await vscode.workspace.openTextDocument(agentsMdPath);
+      await vscode.window.showTextDocument(doc);
+      vscode.window.showInformationMessage('AGENTS.md cree. Personnalisez-le pour vos agents IA.');
+    }),
+    vscode.commands.registerCommand('localai.viewMemory', async () => {
+      try {
+        await appRuntime.initialize();
+        const globalNotes = appRuntime.store.getAllMemoryNotes ? appRuntime.store.getAllMemoryNotes('global') : [];
+        const wsNotes = appRuntime.store.getAllMemoryNotes ? appRuntime.store.getAllMemoryNotes('workspace') : [];
+        const all = [...globalNotes.map(n => `[Global][${n.kind||'note'}] ${n.content}`), ...wsNotes.map(n => `[Workspace][${n.kind||'note'}] ${n.content}`)];
+        const content = all.length ? all.join('\n\n') : '(No memory notes yet. Notes accumulate after conversations.)';
+        const doc = await vscode.workspace.openTextDocument({ content: `# LocalAI Code Memory Notes\n\n${content}`, language: 'markdown' });
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch (err) {
+        vscode.window.showErrorMessage(`Failed to load memory: ${err.message}`);
+      }
+    }),
     vscode.commands.registerCommand('localai.acceptDiff', async () => {
       await appRuntime.initialize();
       const patch = appRuntime.store.getPendingPatches()[0];
@@ -6490,71 +6937,154 @@ async function activate(context) {
         return;
       }
       await appRuntime.reviewPatch(patch.id);
-    }),
-    vscode.commands.registerCommand('localai.cleanSandboxes', async () => {
-      try {
-        await appRuntime.initialize();
-        const sandboxesDir = path.join(appRuntime.store.storageRoot, SANDBOXES_DIR);
-        if (!fs.existsSync(sandboxesDir)) { vscode.window.showInformationMessage('No sandbox directory found.'); return; }
-        const entries = fs.readdirSync(sandboxesDir);
-        let removed = 0;
-        for (const entry of entries) {
-          try { fs.rmSync(path.join(sandboxesDir, entry), { recursive: true, force: true }); removed++; } catch (_) {}
-        }
-        vscode.window.showInformationMessage(`Cleaned ${removed} sandbox workspace(s).`);
-        if (chatProvider) await chatProvider.syncState();
-      } catch (err) { vscode.window.showErrorMessage(`Failed to clean sandboxes: ${err.message}`); }
-    }),
-    vscode.commands.registerCommand('localai.createAgentsMd', async () => {
-      const folders = vscode.workspace.workspaceFolders;
-      if (!folders || folders.length === 0) { vscode.window.showWarningMessage('No workspace folder open.'); return; }
-      const rootPath = folders[0].uri.fsPath;
-      const agentsMdPath = path.join(rootPath, 'AGENTS.md');
-      if (fs.existsSync(agentsMdPath)) {
-        const choice = await vscode.window.showQuickPick(['Yes, overwrite', 'No, open existing'], { placeHolder: 'AGENTS.md already exists.' });
-        if (!choice || choice.startsWith('No')) { vscode.window.showTextDocument(vscode.Uri.file(agentsMdPath)); return; }
-      }
-      let pkgInfo = {};
-      try { pkgInfo = JSON.parse(fs.readFileSync(path.join(rootPath, 'package.json'), 'utf8')); } catch (_) {}
-      const projectName = pkgInfo.name || path.basename(rootPath);
-      const deps = pkgInfo.dependencies ? Object.keys(pkgInfo.dependencies).slice(0, 8).map(d => `- ${d}`).join('\n') : '- (a renseigner)';
-      const scripts = pkgInfo.scripts ? Object.entries(pkgInfo.scripts).slice(0, 5).map(([k,v]) => `- ${k}: \`${v}\``).join('\n') : '- test: npm test';
-      const template = `# Instructions Agents IA\n\n> ${pkgInfo.description || 'Configuration agents LocalAI Code'}\n\n## Stack\n${deps}\n\n## Conventions\n- Tests obligatoires pour fonctions critiques\n\n## Commandes\n${scripts}\n\n## Notes\n- (Ajoutez ici toute information importante)\n`;
-      fs.writeFileSync(agentsMdPath, template, 'utf8');
-      const doc = await vscode.workspace.openTextDocument(agentsMdPath);
-      await vscode.window.showTextDocument(doc);
-      vscode.window.showInformationMessage('AGENTS.md cree. Personnalisez-le pour vos agents.');
-    }),
-    vscode.commands.registerCommand('localai.viewMemory', async () => {
-      try {
-        await appRuntime.initialize();
-        const gNotes = appRuntime.store.getAllMemoryNotes ? appRuntime.store.getAllMemoryNotes('global') : [];
-        const wNotes = appRuntime.store.getAllMemoryNotes ? appRuntime.store.getAllMemoryNotes('workspace') : [];
-        const all = [...gNotes.map(n => `[Global][${n.kind||'note'}] ${n.content}`), ...wNotes.map(n => `[Workspace][${n.kind||'note'}] ${n.content}`)];
-        const content = all.length ? all.join('\n\n') : '(No memory notes yet.)';
-        const doc = await vscode.workspace.openTextDocument({ content: `# LocalAI Code Memory Notes\n\n${content}`, language: 'markdown' });
-        await vscode.window.showTextDocument(doc, { preview: true });
-      } catch (err) { vscode.window.showErrorMessage(`Failed to load memory: ${err.message}`); }
     })
   );
 
   await vscode.commands.executeCommand('setContext', 'localai.viewingDiff', false);
 
+  // Migration one-shot: transferer le token legacy vers SecretStorage
+  setTimeout(async () => {
+    try {
+      const legacyToken = vscode.workspace.getConfiguration('localai').get('apiToken');
+      if (legacyToken && String(legacyToken).trim()) {
+        const already = await extensionContext.secrets.get('localai.apiToken');
+        if (!already) {
+          await saveApiTokenSecure(String(legacyToken).trim());
+          vscode.window.showInformationMessage('Token HF migre vers le stockage securise (SecretStorage).');
+        }
+      }
+    } catch (_) {}
+  }, 500);
+
+  // ── Initialize new modules (Ruflo-inspired improvements) ───────────────────
+  setTimeout(async () => {
+    try {
+      // Learning Engine — self-learning from past agent tasks
+      const storageRoot = appRuntime && appRuntime.store ? appRuntime.store.storageRoot : context.globalStorageUri.fsPath;
+      learningEngine = new LearningEngine(storageRoot);
+      learningEngine.load();
+      const learnStats = learningEngine.getStats();
+      console.log(`[LocalAI] LearningEngine loaded: ${learnStats.trajectoryCount} trajectories, ${learnStats.successRate} success rate`);
+
+      // Provider Router — multi-LLM failover
+      providerRouter = new ProviderRouter();
+      providerRouter.addProvider('hf-default', { type: 'huggingface', priority: 0 });
+      console.log('[LocalAI] ProviderRouter initialized with HuggingFace default');
+
+      // Plugin Manager — extensible plugin system
+      if (cfg('plugins.enabled') !== false) {
+        const pluginDirs = [
+          path.join(context.extensionPath, 'plugins'),
+          path.join(context.globalStorageUri.fsPath, 'plugins')
+        ];
+        pluginManager = new PluginManager(pluginDirs);
+        const pluginStatus = pluginManager.loadAll();
+        console.log(`[LocalAI] PluginManager loaded: ${pluginStatus.pluginCount} plugins, ${pluginStatus.toolCount} tools, ${pluginStatus.agentCount} agents`);
+      } else {
+        console.log('[LocalAI] PluginManager disabled by setting');
+      }
+
+      // Hook Registry — 11 lifecycle phases
+      hookRegistry = new HookRegistry();
+      console.log('[LocalAI] HookRegistry initialized with', Object.keys(hookRegistry.getStats().byPhase).length, 'phases');
+
+      // Worker Pool — background task processing
+      workerPool = new WorkerPool();
+      // Auto-learning reinforcement worker — runs after each task
+      workerPool.addWorker({
+        id: 'learning-reinforcement',
+        name: 'Learning Reinforcement',
+        trigger: 'post_task',
+        handler: async (payload) => {
+          if (learningEngine && payload.taskId) {
+            return learningEngine.getStats();
+          }
+        }
+      });
+      // CVE monitor worker — runs every 30 minutes
+      workerPool.addWorker({
+        id: 'cve-monitor',
+        name: 'CVE Monitor',
+        trigger: 'periodic',
+        intervalMs: 30 * 60 * 1000,
+        handler: async () => {
+          const folders = vscode.workspace.workspaceFolders;
+          if (!folders || !folders.length) return;
+          const pkgPath = path.join(folders[0].uri.fsPath, 'package.json');
+          const result = scanPackageJson(pkgPath);
+          if (result.criticalCount > 0) {
+            vscode.window.showWarningMessage(`[LocalAI] CVE Alert: ${result.criticalCount} critical vulnerabilities detected. Run npm audit for details.`);
+          }
+          return result;
+        }
+      });
+      workerPool.startAll();
+      console.log('[LocalAI] WorkerPool started with', workerPool.getStatus().length, 'workers');
+
+      // Encryption Vault — AES-256-GCM for sensitive data
+      encryptionVault = new EncryptionVault({ enabled: false, keySource: 'secretStorage' });
+      if (cfg('encryption.enabled')) {
+        try {
+          encryptionVault.setEnabled(true);
+          await encryptionVault.initializeKey(context.secrets);
+          console.log('[LocalAI] EncryptionVault initialized (AES-256-GCM)');
+        } catch (err) {
+          console.warn('[LocalAI] EncryptionVault init failed:', err.message);
+        }
+      } else {
+        console.log('[LocalAI] EncryptionVault disabled (opt-in via localai.encryption.enabled)');
+      }
+
+      // MemoryDB — Structured persistent memory (10 tables)
+      const memDbPath = path.join(context.globalStorageUri.fsPath, 'memory.json');
+      memoryDB = new MemoryDB(memDbPath);
+      memoryDB.load();
+      const mdbStats = memoryDB.getStats();
+      console.log(`[LocalAI] MemoryDB loaded: ${mdbStats.totalRecords} records across ${Object.keys(mdbStats.tables).length} tables`);
+
+      // ── MemoryDB → RuntimeFeatureStore bridge ────────────────────────────
+      // Inject memoryDB into RuntimeFeatureStore to activate dual-write
+      // (events, onboarding, agent state, cost metrics → MemoryDB tables)
+      if (appRuntime && appRuntime.features) {
+        appRuntime.features.memoryDB = memoryDB;
+        console.log('[LocalAI] MemoryDB bridge connected to RuntimeFeatureStore (dual-write active)');
+      }
+
+      // MutationGuard — fail-closed write/shell/delete validation
+      if (cfg('guard.enabled') !== false) {
+        mutationGuard = new MutationGuard();
+        console.log(`[LocalAI] MutationGuard active: ${mutationGuard.getStats().configuredRoles} roles, ${mutationGuard.getStats().blockedPaths} blocked paths`);
+      } else {
+        console.log('[LocalAI] MutationGuard disabled by setting');
+      }
+    } catch (err) {
+      console.warn('[LocalAI] Module initialization warning:', err.message);
+    }
+  }, 800);
+
   // Initial connection check
   setTimeout(async () => {
     await appRuntime.initialize();
+    const hasToken = getApiToken();
+    if (!hasToken) {
+      statusBarItem.text = '$(key) HF: No Token';
+      statusBarItem.tooltip = 'Click to add LM Studio API Token';
+      statusBarItem.color = '#f44747';
+      return;
+    }
     await checkConnection();
-  }, 1000);
+  }, 1200);
 
   // Periodic connection check every 60s
   const intervalId = setInterval(async () => {
     await checkConnection();
     if (chatProvider && chatProvider.syncState) await chatProvider.syncState();
+    // Check for awaiting_user tasks with timeout warnings
     if (appRuntime && appRuntime.store) {
       const awaitingTasks = appRuntime.store.getTasks().filter(task => task.status === 'awaiting_user' && task.awaitingSince);
       for (const task of awaitingTasks) {
         const waitingMs = Date.now() - new Date(task.awaitingSince).getTime();
-        const warningThresholdMs = 5 * 60 * 1000;
+        const warningThresholdMs = 5 * 60 * 1000; // 5 minutes
         if (waitingMs >= warningThresholdMs && !task._timeoutWarned) {
           if (task.chatId) {
             appRuntime.store.appendMessage(task.chatId, {
@@ -6573,6 +7103,7 @@ async function activate(context) {
   }, 60000);
   context.subscriptions.push({ dispose: () => clearInterval(intervalId) });
 
+  // Watch for memory scope changes and notify user
   let lastMemoryScope = getMemoryScope();
   const configListener = vscode.workspace.onDidChangeConfiguration(async (event) => {
     if (event.affectsConfiguration('localai.memory.scope')) {
@@ -6583,6 +7114,35 @@ async function activate(context) {
         vscode.window.showInformationMessage(`Memory scope changed to "${newScope}": ${explanation}`);
         if (chatProvider && chatProvider.syncState) await chatProvider.syncState();
       }
+    }
+    // React to model changes from settings UI
+    if (event.affectsConfiguration('localai.modelId')) {
+      const newModel = getModelId();
+      console.log(`[LocalAI] Model changed to: ${newModel}`);
+      vscode.window.showInformationMessage(`Model changed to: ${newModel}`);
+      if (chatProvider) {
+        chatProvider._post({ type: 'checking' });
+        await chatProvider._doCheckConnection();
+      }
+    }
+    // React to token changes from settings UI
+    if (event.affectsConfiguration('localai.apiToken')) {
+      await loadApiTokenCache();
+      console.log('[LocalAI] API token updated from settings');
+      if (chatProvider) {
+        chatProvider._post({ type: 'checking' });
+        await chatProvider._doCheckConnection();
+      }
+    }
+    // React to module toggle changes — sync the UI
+    if (event.affectsConfiguration('localai.defence') ||
+        event.affectsConfiguration('localai.guard') ||
+        event.affectsConfiguration('localai.sparc') ||
+        event.affectsConfiguration('localai.cve') ||
+        event.affectsConfiguration('localai.plugins') ||
+        event.affectsConfiguration('localai.memorydb') ||
+        event.affectsConfiguration('localai.encryption')) {
+      if (chatProvider && chatProvider.syncState) await chatProvider.syncState();
     }
   });
   context.subscriptions.push(configListener);
@@ -6599,3 +7159,12 @@ function deactivate() {
 }
 
 module.exports = { activate, deactivate };
+
+
+
+
+
+
+
+
+

@@ -371,6 +371,24 @@
           "default": 4000,
           "description": "Default maximum characters returned by the web_fetch tool.",
           "order": 47
+        },
+        "localai.defence.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable AIDefence layer: prompt injection detection, PII/secrets scanning, and dangerous shell command blocking.",
+          "order": 60
+        },
+        "localai.guard.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable MutationGuard: fail-closed write/shell/delete validation per agent role. When disabled, all agents can write freely.",
+          "order": 61
+        },
+        "localai.encryption.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the AES-256-GCM encryption vault for sensitive data at rest. Key is stored in VS Code SecretStorage.",
+          "order": 66
         }
       }
     },
@@ -489,6 +507,12 @@
           "id": "localai.chatView",
           "name": "Chat",
           "icon": "resources/icon-activity.svg"
+        },
+        {
+          "type": "webview",
+          "id": "localai.securityView",
+          "name": "Security & Modules",
+          "icon": "resources/icon-security.svg"
         }
       ]
     },
