@@ -1,0 +1,24 @@
+.git/**
+.gitignore
+.github/**
+.qwen/**
+.vscode-test/**
+scripts/**
+test/**
+test-modules.js
+*.vsix
+*.log
+*.md
+!README.md
+!CHANGELOG.md
+!LICENSE
+.tmp-webview-test.html
+node_modules/**
+cloud-executor/**
+docs/**
+plugins/**
+sandbox/**
+skills/**
+resources/**
+task_*.txt
+Codex vs.*

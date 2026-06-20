@@ -1,0 +1,46 @@
+{
+  "id": "design-system",
+  "name": "UI/UX Pro Max Design System Generator",
+  "version": "1.0.0",
+  "description": "Integrates UI/UX Pro Max intelligence (67 styles, 161 palettes, 57 fonts, 99 UX guidelines) for automated design system generation.",
+  "author": "HF AI Code",
+  "tools": [
+    {
+      "name": "generate_design_system",
+      "description": "Generate a complete design system (colors, typography, style, patterns, effects, anti-patterns) for a project using UI/UX Pro Max intelligence database with 161 reasoning rules.",
+      "example": "{\"query\":\"beauty spa wellness elegant\",\"projectName\":\"Serenity Spa\",\"stack\":\"react\"}",
+      "handler": "tools/designSystem.js"
+    },
+    {
+      "name": "search_design_domain",
+      "description": "Search a specific design domain for detailed recommendations. Domains: style, color, typography, landing, chart, ux, product, prompt, web, react.",
+      "example": "{\"query\":\"glassmorphism dark mode\",\"domain\":\"style\",\"maxResults\":5}",
+      "handler": "tools/designSystem.js"
+    },
+    {
+      "name": "get_stack_guidelines",
+      "description": "Get implementation-specific best practices for a tech stack. Stacks: html-tailwind, react, nextjs, vue, svelte, shadcn.",
+      "example": "{\"query\":\"responsive layout\",\"stack\":\"react\"}",
+      "handler": "tools/designSystem.js"
+    }
+  ],
+  "agents": [
+    {
+      "type": "design-system-expert",
+      "title": "Design System Expert",
+      "stepBudget": 25,
+      "systemPrompt": "You are a Design System Expert specializing in UI/UX Pro Max intelligence. Your role is to generate comprehensive design systems based on product type, industry, and style keywords. You always start by generating a design system, then apply its rules consistently. You enforce the pre-delivery checklist (no emoji icons, cursor-pointer on all clickable elements, smooth transitions 150-300ms, proper light/dark mode contrast, WCAG accessibility). You know 67 UI styles, 161 color palettes, 57 font pairings, and 99 UX guidelines."
+    }
+  ],
+  "hooks": [
+    {
+      "phase": "pre_prompt",
+      "match": {
+        "keywords": ["ui", "design", "landing", "page", "component", "layout", "style", "color", "font", "dark mode", "light mode"]
+      },
+      "action": "annotate",
+      "annotation": "UI/UX task detected. Consider using generate_design_system tool for comprehensive design recommendations before implementing."
+    }
+  ],
+  "contextProviders": []
+}
